@@ -1,0 +1,27 @@
+[project]
+name = "openshield"
+version = "0.1.0"
+description = "..."
+readme = "README.md"
+authors = [
+    { name = "shahina" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "typer>=0.27.1",
+]
+
+[project.scripts]
+openshield = "openshield.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "respx>=0.23.1",
+]
