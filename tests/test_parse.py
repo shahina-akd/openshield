@@ -1,22 +1,18 @@
-from typing import get_args
+"""parse.py -- argv -> Invocation, specifier -> kind. Pure string handling.
 
+PackageRef validation lives in test_models.py. What this file asserts is
+classification: which forms are refused, and whether an install can hide.
+"""
 import pytest
-from pydantic import ValidationError
 
-from openshield.models import (
-    RESOLVABLE,
-    SEMVER,
-    PackageRef,
-    SpecifierKind,
-    UnresolvableReason,
-)
+from openshield.models import RESOLVABLE, SEMVER
 from openshield.parse import (
     classify_invocation,
     classify_specifier,
     split_specifier,
 )
 
-# -------------------------------- split_specifier ------------------------------
+# -------------------------------- split_specifier --------------------------------
 
 @pytest.mark.parametrize("spec,expected", [
     ("axios",                  ("axios", None)),
@@ -33,7 +29,7 @@ def test_split_specifier(spec, expected):
     assert split_specifier(spec) == expected
 
 
-# ------------------------------ classify_specifier -----------------------------
+# ------------------------------ classify_specifier -------------------------------
 
 RESOLVABLE_CASES = [
     ("axios",                        "registry"),
@@ -42,7 +38,7 @@ RESOLVABLE_CASES = [
     ("@babel/core",                  "registry"),
     ("@babel/core@7.24.0",           "registry"),
     # npm installs this form, so parse MUST accept it. resolve() strips the
-    # 'v' before constructing the PackageRef -- see the canonical test below.
+    # 'v' before constructing the PackageRef -- see test_models.py.
     ("axios@v1.7.2",                 "registry"),
     ("next@14.2.0-canary.3",         "registry"),   # prerelease is still exact
     ("pkg@1.0.0+build.5",            "registry"),
@@ -122,7 +118,7 @@ def test_unresolvable_never_lands_in_resolvable(spec, _kind):
     assert classify_specifier(spec) not in RESOLVABLE
 
 
-def test_parse_keeps_the_v_form_resolvable():
+def test_keeps_the_v_form_resolvable():
     """Guards against 'simplifying' SEMVER by deleting the `v?`. Without it,
     axios@v1.7.2 falls through to _TAG (which matches ^[A-Za-z]) and is refused
     as a tag -- refusing a legitimate exact version npm would install."""
@@ -130,7 +126,7 @@ def test_parse_keeps_the_v_form_resolvable():
     assert classify_specifier("axios@v") == "tag"      # a bare 'v' really IS a tag
 
 
-def test_uppercase_v_form_is_refused_by_parse():
+def test_uppercase_v_form_is_refused():
     """node-semver accepts a lowercase prefix only. Label unpinned -- it
     currently reads as 'tag' via _TAG. What matters is that it never reaches
     the network."""
@@ -142,149 +138,21 @@ def test_uppercase_v_form_is_refused_by_parse():
 ])
 def test_trailing_whitespace_versions_are_refused(spec):
     """Label unpinned deliberately: which of 'range'/'unknown' this lands in
-    depends on anchor details in _RANGE, and both are equally refused. The
+    depends on anchor details inside _RANGE, and both are equally refused. The
     property is that it never reaches the network."""
     assert classify_specifier(spec) not in RESOLVABLE
 
 
-# --------------------------------- PackageRef ----------------------------------
-
-@pytest.mark.parametrize("version", ["^1.0.0", "latest", "1.2", "", "npm:react"])
-def test_package_ref_refuses_inexact_versions(version):
-    with pytest.raises(ValueError):
-        PackageRef(name="axios", version=version)
-
-
-def test_package_ref_refuses_non_canonical_versions():
-    """SEMVER permits a lowercase 'v' so parse.py can classify `axios@v1.7.2`
-    as resolvable -- npm accepts that form. The identity may not carry it:
-    npm:axios@v1.7.2 and npm:axios@1.7.2 would be two cache keys and two
-    decision rows for one package, so an M2 approval would silently fail to
-    apply. resolve.normalize_version() strips it; arriving here with one means
-    that step was skipped, and the message must say so."""
-    with pytest.raises(ValidationError, match="canonical"):
-        PackageRef(name="axios", version="v1.7.2")
-
-
-def test_uppercase_v_is_not_a_version_at_all():
-    """node-semver accepts a lowercase prefix only, so V1.7.2 is not a
-    near-miss to normalize -- it fails the exactness check outright, and
-    normalize_version() must not 'helpfully' strip it."""
-    with pytest.raises(ValidationError, match="must be exact"):
-        PackageRef(name="axios", version="V1.7.2")
-
-
-@pytest.mark.parametrize("version", [
-    "1.7.2\n", "1.7.2\r\n", " 1.7.2", "1.7.2 ", "1.7.2\t",
-])
-def test_whitespace_never_reads_as_an_exact_version(version):
-    """'$' matches at end of string OR immediately before a trailing newline,
-    so SEMVER.match('1.7.2\\n') succeeds. A version arriving from $(cat VERSION)
-    or a changelog paste would become a distinct cache key for one package."""
-    with pytest.raises(ValueError):
-        PackageRef(name="axios", version=version)
-
-
-def test_semver_is_only_ever_used_with_fullmatch():
-    """Asserts the trap itself, so nobody 'simplifies' a call site back to
-    .match(). The regex ends in '$', which is not end-of-string."""
-    assert SEMVER.match("1.7.2\n")          # the trap, demonstrated
-    assert not SEMVER.fullmatch("1.7.2\n")  # the fix
-
-
-@pytest.mark.parametrize("name", [
-    "",
-    "../etc",
-    "./package",
-    "a b",
-    "_private",
-    ".private",
-    "@scope",
-    "@scope/",
-    "UP/down",          # an unscoped '/' is git shorthand, not a name
-    "axiós",            # \w is Unicode-aware by default -- re.ASCII closes it
-    "@scopé/pkg",
-    "axios\n",          # '$' matches before a trailing newline; needs fullmatch
-    "a" * 215,          # npm's limit is 214, scope included
-])
-def test_package_ref_refuses_invalid_names(name):
-    with pytest.raises(ValueError):
-        PackageRef(name=name, version="1.7.2")
-
-
-@pytest.mark.parametrize("name", [
-    "axios",
-    "lodash",
-    "my-package",
-    "package.js",
-    "foo_bar",
-    "@babel/core",
-    "@types/node",
-    "@scope/my-package",
-    # Legal-but-legacy. npm refuses NEW uppercase names; published ones still
-    # install, so refusing them here raises on a real package.
-    "JSONStream",
-    "@types/Node",
-    "a",                # single character
-    "a" * 214,          # exactly at the limit
-])
-def test_package_ref_accepts_valid_names(name):
-    assert PackageRef(name=name, version="1.7.2").name == name
-
-
-def test_package_ref_canonical_and_hashable():
-    ref = PackageRef(name="axios", version="1.7.2")
-    assert ref.canonical == "npm:axios@1.7.2"
-    assert len({ref, PackageRef(name="axios", version="1.7.2")}) == 1
-
-
-def test_package_ref_rejects_unknown_fields():
-    """Without extra='forbid', a typo'd kwarg silently constructs with the
-    default. This model is half of an M2 decision primary key."""
-    with pytest.raises(ValidationError):
-        PackageRef(name="axios", version="1.7.2", ecosytem="npm")
-
-
-def test_package_ref_is_immutable():
-    ref = PackageRef(name="axios", version="1.7.2")
-    with pytest.raises(ValidationError):
-        ref.version = "1.7.3"
-
-
-def test_classify_accepts_names_that_package_ref_would_reject():
-    """classify_specifier validates the FORM, not the name -- it splits and
-    inspects the version only. So 'registry' does not imply constructible, and
-    resolve() must catch ValidationError and return Unresolvable rather than
-    letting it escape. This test documents the gap; Step 0.3 closes it."""
+def test_classification_is_about_form_not_name():
+    """classify_specifier splits and inspects the VERSION only -- it never
+    validates the name. So 'registry' does not imply PackageRef will accept it,
+    which is why resolve() must catch ValidationError rather than let it
+    escape. Asserted end-to-end in test_resolve.py."""
     assert classify_specifier("axiós") in RESOLVABLE
-    with pytest.raises(ValidationError):
-        PackageRef(name="axiós", version="1.0.0")
+    assert classify_specifier("A" * 300) in RESOLVABLE
 
 
-# ----------------------------- reason vocabularies -----------------------------
-
-def test_every_refused_kind_is_a_valid_unresolvable_reason():
-    """resolve() passes a non-resolvable SpecifierKind straight through as an
-    Unresolvable.reason. That is only sound if the label sets line up."""
-    kinds = set(get_args(SpecifierKind))
-    reasons = set(get_args(UnresolvableReason))
-    assert kinds - RESOLVABLE <= reasons
-
-
-def test_resolvable_kinds_are_never_reasons():
-    """'registry' must not be expressible as a refusal reason -- the gate in
-    resolve() excludes it, and the type should say so too."""
-    assert not (RESOLVABLE & set(get_args(UnresolvableReason)))
-
-
-def test_resolve_only_reasons_have_no_parse_equivalent():
-    """not_found and network are lookup outcomes, not classifications. If one
-    appeared in SpecifierKind, parse.py would be claiming knowledge it cannot
-    have without the network."""
-    assert {"not_found", "network"}.isdisjoint(get_args(SpecifierKind))
-
-
-# ------------------------------ classify_invocation ----------------------------
+# ------------------------------ classify_invocation ------------------------------
 
 @pytest.mark.parametrize("argv,specs", [
     (["npm", "install", "axios"],                        ["axios"]),
