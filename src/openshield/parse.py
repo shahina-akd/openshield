@@ -102,11 +102,11 @@ def classify_specifier(spec: str) -> SpecifierKind:
 # interception hole. Reconcile against `npm help install`.
 _INSTALL_ALIASES = frozenset({
     "install", "i", "in", "ins", "inst", "insta", "instal", "add",
-    "isnt", "isnta", "isntal", "isntall",
+    "isnt", "isnta", "isntal", "isntall", "install-test", "it",
 })
 
 _LOCKFILE_COMMANDS = frozenset({
-    "ci",
+    "ci", "install-ci-test", "cit", "clean-install-test", "sit",
 })
 
 # Every other npm command. Incompleteness here is SAFE: an unrecognised

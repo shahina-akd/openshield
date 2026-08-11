@@ -179,6 +179,11 @@ def test_intercepted(argv, specs):
     assert inv.kind == "intercepted"
     assert inv.specifiers == specs
 
+def test_every_npm_command_that_installs_is_intercepted():
+    for cmd in ["install", "i", "add", "isntall", "install-test", "it"]:
+        inv = classify_invocation(["npm", cmd, "axios"])
+        assert inv.kind == "intercepted", cmd
+        assert inv.specifiers == ["axios"], cmd
 
 @pytest.mark.parametrize("argv", [
     ["npm", "--before", "2023-01-01", "install", "axios"],
@@ -203,6 +208,7 @@ def test_unknown_value_flags_do_not_hide_an_install(argv):
     (["npm", "ci"],                  "ci"),
     (["npm"],                        None),
 ])
+
 def test_pass_through(argv, sub):
     inv = classify_invocation(argv)
     assert inv.kind == "pass_through"
@@ -233,6 +239,10 @@ def test_lockfile_install_is_flagged_separately_from_bare_install():
     assert inv.bare_install is False
     assert inv.lockfile_install is True
 
+def test_every_npm_command_that_installs_a_lockfile_is_flagged():
+    for cmd in ["ci", "cit", "install-ci-test"]:
+        inv = classify_invocation(["npm", cmd])
+        assert inv.lockfile_install is True, cmd
 
 def test_ls_is_ordinary_pass_through():
     inv = classify_invocation(["npm", "ls"])
