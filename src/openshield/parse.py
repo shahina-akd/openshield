@@ -9,17 +9,23 @@ from .models import SEMVER, Invocation, SpecifierKind
 # --------------------------------- SPECIFIERS ---------------------------------
 
 # A dist-tag is a bare identifier: `latest`, `next`, `beta`, `canary`.
+# Used with .fullmatch() -- '$' alone would let `beta\n` through as a tag.
 _TAG = re.compile(r"^[A-Za-z][0-9A-Za-z._-]*$")
 
 # Range-ish forms. Incompleteness here is SAFE: anything unmatched falls to
 # "unknown", which is equally unresolvable. This regex only refines the
 # label, it never decides whether something is refused.
+#
+# '\Z' rather than '$' in the numeric alternative: '$' also matches before a
+# trailing newline, so `1.7.2\n` would read as "range" rather than "unknown".
+# Cosmetic -- both are refused -- but it keeps every anchor in the project
+# meaning end-of-string.
 _RANGE = re.compile(
     r"^[\^~]"                    # ^1.0.0  ~1.2
     r"|^[><]=?"                  # >=1.0.0  >1.0.0
     r"|^="                       # =1.7.2
-    r"|^\*$"                     # *
-    r"|^v?[\dxX][\d.xX*]*$"      # 1.2  1.2.x  1.*
+    r"|^\*\Z"                    # *
+    r"|^v?[\dxX][\d.xX*]*\Z"     # 1.2  1.2.x  1.*
     r"|\|\|"                     # 1.2.3 || 1.4.0   (anywhere)
     r"|\s-\s"                    # 1.2.3 - 1.4.0    (anywhere)
 )
@@ -49,7 +55,11 @@ def split_specifier(spec: str) -> tuple[str, str | None]:
 def classify_specifier(spec: str) -> SpecifierKind:
     """Only bare names and exact versions are resolvable. Everything else is
     refused and labelled; an unanticipated form becomes 'unknown', never a
-    confident lookup of the wrong version."""
+    confident lookup of the wrong version.
+
+    Note this validates the *form*, not the name -- 'registry' does not imply
+    that PackageRef will accept it. resolve() catches that separately.
+    """
     if spec in (".", "..") or spec.startswith(("./", "../", "/", "~/", "file:")):
         return "local_path"
 
@@ -75,9 +85,10 @@ def classify_specifier(spec: str) -> SpecifierKind:
     if version.startswith("npm:"):
         return "alias"
 
+    # fullmatch, always: SEMVER ends in '$', which is not end-of-string.
     if SEMVER.fullmatch(version):
         return "registry"
-    if _TAG.match(version):
+    if _TAG.fullmatch(version):
         return "tag"
     if _RANGE.search(version):
         return "range"
@@ -190,6 +201,7 @@ def classify_invocation(argv: list[str]) -> Invocation:
             subcommand=sub,
             specifiers=[],
         )
+
     specs: list[str] = []
     j = i + 1
 
@@ -217,8 +229,8 @@ def classify_invocation(argv: list[str]) -> Invocation:
         )
 
     return Invocation(
-        kind="intercepted", 
-        npm_args=args, 
-        subcommand=sub, 
+        kind="intercepted",
+        npm_args=args,
+        subcommand=sub,
         specifiers=specs,
     )
