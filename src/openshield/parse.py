@@ -75,7 +75,7 @@ def classify_specifier(spec: str) -> SpecifierKind:
     if version.startswith("npm:"):
         return "alias"
 
-    if SEMVER.match(version):
+    if SEMVER.fullmatch(version):
         return "registry"
     if _TAG.match(version):
         return "tag"
@@ -94,11 +94,15 @@ _INSTALL_ALIASES = frozenset({
     "isnt", "isnta", "isntal", "isntall",
 })
 
+_LOCKFILE_COMMANDS = frozenset({
+    "ci",
+})
+
 # Every other npm command. Incompleteness here is SAFE: an unrecognised
 # command falls through to pass_through, which is correct for anything that
 # is not an install.
 _OTHER_COMMANDS = frozenset({
-    "access", "audit", "bugs", "cache", "ci", "config", "dedupe", "deprecate",
+    "access", "audit", "bugs", "cache", "config", "dedupe", "deprecate",
     "diff", "dist-tag", "docs", "doctor", "edit", "exec", "explain", "explore",
     "find-dupes", "fund", "help", "hook", "init", "la", "link", "list", "ll",
     "login", "logout", "ls", "org", "outdated", "owner", "pack", "ping", "pkg",
@@ -109,7 +113,7 @@ _OTHER_COMMANDS = frozenset({
     "update", "version", "view", "whoami",
 })
 
-_KNOWN_COMMANDS = _INSTALL_ALIASES | _OTHER_COMMANDS
+_KNOWN_COMMANDS = _INSTALL_ALIASES | _LOCKFILE_COMMANDS | _OTHER_COMMANDS
 
 # Flags whose *next* token is a value. Incompleteness here degrades to a
 # spurious specifier that resolves to not_found and is surfaced -- noisy,
@@ -170,33 +174,51 @@ def classify_invocation(argv: list[str]) -> Invocation:
 
     i, sub = _find_subcommand(args)
 
-    if sub not in _INSTALL_ALIASES:
+    if sub in _LOCKFILE_COMMANDS:
         return Invocation(
-            kind="pass_through", npm_args=args, subcommand=sub, specifiers=[]
+            kind="pass_through",
+            npm_args=args,
+            subcommand=sub,
+            specifiers=[],
+            lockfile_install=True,
         )
 
+    if sub not in _INSTALL_ALIASES:
+        return Invocation(
+            kind="pass_through",
+            npm_args=args,
+            subcommand=sub,
+            specifiers=[],
+        )
     specs: list[str] = []
     j = i + 1
+
     while j < len(args):
         tok = args[j]
+
         if tok == "--":
             j += 1
             continue
+
         if tok.startswith("-"):
             j = _advance(args, j)
             continue
+
         specs.append(tok)
         j += 1
 
     if not specs:
-        # Lockfile install. Nothing was typed to review, and transitive
-        # dependencies are out of scope -- but this DOES run
-        # postinstall scripts. Passed through knowingly; stated in the README.
         return Invocation(
-            kind="pass_through", npm_args=args, subcommand=sub,
-            specifiers=[], bare_install=True,
+            kind="pass_through",
+            npm_args=args,
+            subcommand=sub,
+            specifiers=[],
+            bare_install=True,
         )
 
     return Invocation(
-        kind="intercepted", npm_args=args, subcommand=sub, specifiers=specs
+        kind="intercepted", 
+        npm_args=args, 
+        subcommand=sub, 
+        specifiers=specs,
     )

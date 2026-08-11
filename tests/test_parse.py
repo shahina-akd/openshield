@@ -103,7 +103,7 @@ def test_only_exact_or_bare_is_ever_resolvable():
     for spec, _ in ALL_CASES:
         if classify_specifier(spec) in RESOLVABLE:
             _, version = split_specifier(spec)
-            assert version is None or SEMVER.match(version), spec
+            assert version is None or SEMVER.fullmatch(version), spec
 
 
 @pytest.mark.parametrize("spec,_kind", UNRESOLVABLE_CASES)
@@ -118,6 +118,36 @@ def test_package_ref_refuses_inexact_versions(version):
     with pytest.raises(ValueError):
         PackageRef(name="axios", version=version)
 
+@pytest.mark.parametrize("name", [
+    "",
+    "../etc",
+    "./package",
+    "a b",
+    "_private",
+    ".private",
+    "Axios",
+    "@scope",
+    "@scope/",
+    "@Scope/package",
+])
+def test_package_ref_refuses_invalid_names(name):
+    with pytest.raises(ValueError):
+        PackageRef(name=name, version="1.7.2")
+
+@pytest.mark.parametrize("name", [
+    "axios",
+    "lodash",
+    "my-package",
+    "package.js",
+    "foo_bar",
+    "@babel/core",
+    "@types/node",
+    "@scope/my-package",
+])
+def test_package_ref_accepts_valid_names(name):
+    ref = PackageRef(name=name, version="1.7.2")
+
+    assert ref.name == name
 
 def test_package_ref_canonical_and_hashable():
     ref = PackageRef(name="axios", version="1.7.2")
@@ -176,6 +206,7 @@ def test_unknown_value_flags_do_not_hide_an_install(argv):
     (["npm", "ci"],                  "ci"),
     (["npm"],                        None),
 ])
+
 def test_pass_through(argv, sub):
     inv = classify_invocation(argv)
     assert inv.kind == "pass_through"
@@ -189,12 +220,34 @@ def test_value_flag_value_is_not_mistaken_for_a_command():
     assert inv.subcommand == "publish"
 
 
-def test_bare_install_passes_through_but_is_flagged():
+def test_bare_install_is_distinct_from_lockfile_install():
     inv = classify_invocation(["npm", "install"])
+
     assert inv.kind == "pass_through"
+    assert inv.subcommand == "install"
+    assert inv.specifiers == []
     assert inv.bare_install is True
+    assert inv.lockfile_install is False
 
 
 def test_npm_args_never_include_npm():
     assert classify_invocation(["npm", "install", "axios"]).npm_args == \
         ["install", "axios"]
+
+def test_lockfile_install_is_flagged_separately_from_bare_install():
+    inv = classify_invocation(["npm", "ci"])
+
+    assert inv.kind == "pass_through"
+    assert inv.subcommand == "ci"
+    assert inv.specifiers == []
+    assert inv.bare_install is False
+    assert inv.lockfile_install is True
+
+def test_ls_is_ordinary_pass_through():
+    inv = classify_invocation(["npm", "ls"])
+
+    assert inv.kind == "pass_through"
+    assert inv.subcommand == "ls"
+    assert inv.specifiers == []
+    assert inv.bare_install is False
+    assert inv.lockfile_install is False

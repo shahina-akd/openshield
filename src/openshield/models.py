@@ -16,22 +16,28 @@ SEMVER = re.compile(
     r"(?:\+[0-9A-Za-z.-]+)?$"    # build metadata
 )
 
+ # npm's rules: lowercase, <=214 chars, optional @scope/, no leading dot
+# or underscore, URL-safe characters only.
+_NAME = re.compile(r"^(?:@[a-z0-9][\w.-]*/)?[a-z0-9][\w.-]*$")
+
 
 class PackageRef(BaseModel):
-    """An exact thing npm will install. Frozen: it is a cache key and part of
-    a decision primary key, so it must be hashable and must not drift."""
-
     model_config = ConfigDict(frozen=True)
 
     ecosystem: Literal["npm"] = "npm"
     name: str
     version: str
 
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, v: str) -> str:
+        if len(v) > 214 or not _NAME.match(v):
+            raise ValueError(f"invalid npm package name: {v!r}")
+        return v
+
     @field_validator("version")
     @classmethod
     def _must_be_exact(cls, v: str) -> str:
-        # SPEC 7 / CONTEXT 4.1: never a range, never a dist-tag. A
-        # non-negotiable that depends on callers remembering it isn't one.
         if not SEMVER.match(v):
             raise ValueError(f"PackageRef.version must be exact, got {v!r}")
         return v
@@ -67,14 +73,17 @@ UnresolvableReason = Literal[
 
 
 class Unresolvable(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     specifier: str
     reason: UnresolvableReason
     detail: str | None = None
 
 
 class Invocation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     kind: Literal["intercepted", "pass_through"]
     npm_args: list[str]         # forwarded to execute.run_npm verbatim
     subcommand: str | None
     specifiers: list[str]       # raw strings, unclassified
     bare_install: bool = False  # `npm install` with no specifiers
+    lockfile_install: bool = False
