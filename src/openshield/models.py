@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from datetime import datetime
+from pydantic import BaseModel, ConfigDict, field_validator, Field, model_validator
 
-from pydantic import BaseModel, ConfigDict, field_validator
 
 # Exact semver. This regex is the definition of "an exact version" for the
 # whole project: parse.py uses it to classify, PackageRef uses it to refuse
@@ -79,6 +80,88 @@ class PackageRef(BaseModel):
     def canonical(self) -> str:
         return f"{self.ecosystem}:{self.name}@{self.version}"
 
+# Two vocabularies, deliberately different, deliberately not interchangeable.
+# A vulnerability is "moderate" (GHSA's word). A package's risk band is
+# "medium" (§9.5's word). Keeping them as separate Literals makes a mix-up a
+# type error instead of an odd line of output.
+Severity = Literal["critical", "high", "moderate", "low", "unknown"]
+RiskLevel = Literal["critical", "high", "medium", "low"]
+
+
+def _require_aware(v: datetime) -> datetime:
+    """§17: timezone-aware UTC, never naive. Enforced at the boundary because
+    a naive timestamp written to the M1 cache and read back in M2 is a silent
+    hour-offset bug in `history` with no visible cause."""
+    if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+        raise ValueError("timestamps must be timezone-aware")
+    return v
+
+
+class SourceRef(BaseModel):
+    # frozen: no lists, so it stays hashable, which lets Evidence.sources be
+    # deduped without a key function.
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str                      # "osv", "npm-registry", "github"
+    fetched_at: datetime
+    from_cache: bool = False       # M1 sets this on a cache hit
+
+    @field_validator("fetched_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return _require_aware(v)
+
+
+class Vulnerability(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str                        # "GHSA-…" / "CVE-…"
+    aliases: list[str] = []
+    summary: str | None = None
+    # OSV publishes severity in at least three shapes. "unknown" is a
+    # legitimate value, not a parse failure -- §9.4 scores it as zero. The
+    # collector must never let an unrecognised shape raise here.
+    severity: Severity
+    fixed_versions: list[str] = [] # may be empty -- no fix published
+    source: SourceRef
+
+
+class Evidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    package: PackageRef
+    vulnerabilities: list[Vulnerability] = []
+    sources: list[SourceRef] = []          # sources that SUCCEEDED
+    partial: bool = False
+    degraded_sources: list[str] = []       # ["github: 403 rate limited"]
+    # registry / repository land in M1 Step 1.2–1.3 as optional fields.
+
+    @model_validator(mode="after")
+    def _partial_names_its_failures(self) -> "Evidence":
+        """§9.1's invariant, made structural: a degraded result must be
+        distinguishable from a clean one. `partial` without a named source is
+        a warning nobody can act on; a named failure without `partial` is a
+        failure the renderer will not show. Neither is constructible."""
+        if self.partial != bool(self.degraded_sources):
+            raise ValueError(
+                "partial and degraded_sources must agree: "
+                f"partial={self.partial}, degraded_sources={self.degraded_sources}"
+            )
+        return self
+
+
+class Assessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence: Evidence
+    # ge/le makes §9.3's clamp structural. A weight change that overflows the
+    # scale becomes a loud test failure rather than "137/100 -- low".
+    score: int = Field(ge=0, le=100)
+    # NOT derivable from `score`: §9.5's override forces at least "high" for an
+    # unfixed critical regardless of the number. Computed in score(), carried
+    # here, never re-derived downstream.
+    risk: RiskLevel
+    scoring_version: str            # §9.2; stored per-decision by §10.3
 
 SpecifierKind = Literal[
     "registry",     # RESOLVABLE: bare name, or exact version

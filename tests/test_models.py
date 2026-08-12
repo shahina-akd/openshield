@@ -3,6 +3,7 @@
 Nothing here imports parse.py. If this file goes red, the identity contract
 broke, not the parser.
 """
+from datetime import datetime, timezone
 from typing import get_args
 
 import pytest
@@ -11,12 +12,32 @@ from pydantic import ValidationError
 from openshield.models import (
     RESOLVABLE,
     SEMVER,
+    Assessment,
+    Evidence,
     Invocation,
     PackageRef,
+    RiskLevel,
+    Severity,
+    SourceRef,
     SpecifierKind,
     Unresolvable,
     UnresolvableReason,
+    Vulnerability,
 )
+
+# Shared fixtures for the evidence models. Deliberately module-level constants
+# rather than pytest fixtures: they are immutable inputs, not per-test state,
+# and half of them are needed inside @parametrize decorators, which run at
+# collection time and cannot see fixtures.
+#
+# Constructed with keyword arguments -- Evidence gains `registry` and
+# `repository` in M1 Step 1.2-1.3, and positional construction is the only
+# thing that would make adding them a breaking change.
+TS = datetime(2026, 1, 1, tzinfo=timezone.utc)
+SOURCE = SourceRef(name="osv", fetched_at=TS)
+REF = PackageRef(name="axios", version="1.7.2")
+EV = Evidence(package=REF)
+
 
 # ------------------------------- version: exactness -----------------------------
 
@@ -187,3 +208,93 @@ def test_invocation_forbids_unknown_fields():
             kind="pass_through", npm_args=[], subcommand="ls",
             specifiers=[], lockfile_instal=True,     # typo'd
         )
+
+
+# ----------------------------- the evidence models -------------------------------
+
+def test_naive_timestamps_are_refused():
+    """§17: timezone-aware UTC, never naive. A naive timestamp written to the
+    M1 cache and read back in M2 is a silent hour-offset bug in `history`."""
+    with pytest.raises(ValidationError):
+        SourceRef(name="osv", fetched_at=datetime(2026, 1, 1))
+
+
+def test_aware_timestamps_are_accepted():
+    assert SourceRef(name="osv", fetched_at=TS).fetched_at == TS
+
+
+@pytest.mark.parametrize("severity", ["severe", "important", "MEDIUM", "", None])
+def test_severity_vocabulary_is_closed(severity):
+    with pytest.raises(ValidationError):
+        Vulnerability(id="GHSA-x", severity=severity, source=SOURCE)
+
+
+def test_unknown_is_a_legitimate_severity():
+    """Not a parse failure. OSV publishes severity in three shapes and §9.4
+    scores an unrecognised one as zero -- the collector must have somewhere
+    honest to put it."""
+    vuln = Vulnerability(id="GHSA-x", severity="unknown", source=SOURCE)
+    assert vuln.severity == "unknown"
+
+
+def test_severity_and_risk_are_different_vocabularies():
+    """'moderate' is a finding; 'medium' is a band. Pinning the difference
+    stops a future 'tidy-up' from merging them."""
+    assert "medium" not in get_args(Severity)
+    assert "moderate" not in get_args(RiskLevel)
+
+
+@pytest.mark.parametrize("partial,degraded", [
+    (True, []),                       # a warning nobody can act on
+    (False, ["github: 403"]),         # a failure the renderer will not show
+])
+def test_partial_and_degraded_sources_must_agree(partial, degraded):
+    with pytest.raises(ValidationError):
+        Evidence(package=REF, partial=partial, degraded_sources=degraded)
+
+
+@pytest.mark.parametrize("partial,degraded", [
+    (False, []),                      # clean
+    (True, ["osv: 503 from api.osv.dev"]),   # degraded, and it says which
+])
+def test_consistent_evidence_constructs(partial, degraded):
+    """The positive half. Without it, a validator that raised unconditionally
+    would pass the test above and make Evidence unconstructible."""
+    ev = Evidence(package=REF, partial=partial, degraded_sources=degraded)
+    assert ev.partial is partial
+
+
+@pytest.mark.parametrize("score", [-1, 101, 137])
+def test_score_is_clamped_by_the_model(score):
+    with pytest.raises(ValidationError):
+        Assessment(evidence=EV, score=score, risk="low", scoring_version="0.1.0")
+
+
+@pytest.mark.parametrize("score", [0, 100])
+def test_the_scale_boundaries_are_inclusive(score):
+    """§9.3 clamps to [0, 100] -- both ends are legal scores, not errors."""
+    assert Assessment(
+        evidence=EV, score=score, risk="low", scoring_version="0.1.0"
+    ).score == score
+
+
+def test_assessment_carries_its_evidence():
+    """§4: every number traces to a visible evidence field. Structural, not
+    conventional -- you cannot hold a score without the evidence behind it."""
+    a = Assessment(evidence=EV, score=80, risk="low", scoring_version="0.1.0")
+    assert a.evidence.package.canonical == "npm:axios@1.7.2"
+
+
+@pytest.mark.parametrize("model,kwargs", [
+    (SourceRef,     dict(name="osv", fetched_at=TS, from_cach=True)),
+    (Vulnerability, dict(id="x", severity="low", source=SOURCE, fixed_version=[])),
+    (Evidence,      dict(package=REF, vulnerabilites=[])),
+    # Every required field is present and correct; the ONLY defect is the
+    # extra key. Omitting scoring_version here would make the test pass on a
+    # missing-field error even with extra='forbid' removed.
+    (Assessment,    dict(evidence=EV, score=1, risk="low",
+                         scoring_version="0.1.0", scoring_verison="0")),
+])
+def test_new_models_forbid_unknown_fields(model, kwargs):
+    with pytest.raises(ValidationError):
+        model(**kwargs)
