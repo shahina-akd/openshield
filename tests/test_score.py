@@ -143,3 +143,16 @@ def test_score_imports_nothing_that_can_read_the_world():
     assert imported <= _ALLOWED_IMPORTS, (
         f"score.py must stay pure; unexpected imports: {imported - _ALLOWED_IMPORTS}"
     )
+
+def test_degraded_evidence_currently_scores_as_if_clean():
+    """DOCUMENTED, NOT ENDORSED. Evidence with no findings scores 100
+    whether that means 'nothing known against this' or 'the source failed'.
+
+    Unreachable in M0: §11.1 routes all-sources-failed to offline_policy
+    before render, and with one collector there is no other way to be
+    partial. It becomes reachable the moment M1 has three sources and only
+    one fails. §9.4 does not currently say what happens then -- decide it in
+    Step 1.5, deliberately, and change this test when you do.
+    """
+    assert score(_ev(partial=True, degraded=["osv: 503"])).score == 100
+    assert score(_ev(partial=True, degraded=["osv: 503"])).risk == "low"
