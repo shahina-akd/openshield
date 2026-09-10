@@ -1,4 +1,7 @@
 import pytest
+import ast
+import inspect
+import openshield.score
 
 from typing import get_args
 from datetime import datetime, timezone
@@ -115,3 +118,28 @@ def test_the_override_does_not_downgrade_a_critical_band():
     `return "high"` would LOWER it. §9.5 says 'at least high', a floor."""
     ev = _ev(*[_vuln("critical", fixed=(), id=f"GHSA-{i}") for i in range(3)])
     assert score(ev).risk == "critical"
+
+
+# ----------------------------- the promise -----------------------------
+_ALLOWED_IMPORTS = {"__future__", "typing", "models"}
+
+
+def test_score_imports_nothing_that_can_read_the_world():
+    """§9.2: no network, no file I/O, no clock, no randomness.
+
+    Checked at the import boundary because that is where it is decidable. A
+    module that never imports httpx, datetime, random, os, or pathlib cannot
+    reach any of them, and this fails the moment someone adds one -- rather
+    than in M1 when a golden test mysteriously expires.
+    """
+    tree = ast.parse(inspect.getsource(openshield.score))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+
+    assert imported <= _ALLOWED_IMPORTS, (
+        f"score.py must stay pure; unexpected imports: {imported - _ALLOWED_IMPORTS}"
+    )
