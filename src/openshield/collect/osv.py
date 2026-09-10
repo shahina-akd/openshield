@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from . import cvss
+
 import httpx
 
 from ..models import PackageRef, Severity, SourceRef, Vulnerability

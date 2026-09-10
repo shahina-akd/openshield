@@ -3,10 +3,11 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 import respx
-
+from openshield.collect import _evidence, collect
 from openshield.collect.osv import (
     MAX_PAGES,
     OSV_QUERY_URL,
+    SourceResult,
     collect_osv,
     fixed_versions,
     parse_vulns,
