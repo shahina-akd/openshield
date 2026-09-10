@@ -44,3 +44,41 @@ class SourceResult:
     vulnerabilities: list[Vulnerability] = field(default_factory=list)
     source: SourceRef | None = None
     error: str | None = None
+
+
+def _as_list(value: object) -> list:
+    """A list, or an empty one. Never raises, never returns None."""
+    return value if isinstance(value, list) else []
+
+
+def _dig(obj: object, *keys: str) -> object | None:
+    """obj['a']['b'] without assuming either level is a dict."""
+    for key in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+# GHSA says MODERATE. CVSS says MEDIUM. §9.1 says moderate. Both publisher
+# words map onto our vocabulary; missing the CVSS spelling means every
+# CVSS-derived medium finding silently lands on "unknown" and scores zero.
+_WORDS = {
+    "critical": "critical",
+    "high": "high",
+    "moderate": "moderate",
+    "medium": "moderate",
+    "low": "low",
+}
+
+
+def _word(value: object) -> Severity | None:
+    """A publisher's severity word, or None if it is not one we recognise.
+
+    An unrecognised word is not a severity -- SEVERE, IMPORTANT, or a private
+    label falls through to the next tier and eventually to "unknown". No fuzzy
+    matching: "unknown" is honest, a guess is not.
+    """
+    if not isinstance(value, str):
+        return None
+    return _WORDS.get(value.strip().casefold())
