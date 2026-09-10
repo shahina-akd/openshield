@@ -165,3 +165,78 @@ def test_withdrawn_advisories_are_dropped():
 def test_every_vulnerability_carries_the_source_that_found_it():
     payload = {"vulns": [_vuln()]}
     assert parse_vulns(payload, REF, SOURCE)[0].source == SOURCE
+
+@respx.mock
+def test_query_sends_the_resolved_version():
+    """Appendix B's 'are you scoring the version you resolved, or the version
+    the user typed?' -- asserted mechanically rather than trusted."""
+    import json
+    route = respx.post(OSV_QUERY_URL).respond(200, json={})
+    collect_osv(REF)
+    assert json.loads(route.calls.last.request.content) == {
+        "version": "1.7.2",
+        "package": {"name": "axios", "ecosystem": "npm"},
+    }
+
+
+@respx.mock
+@pytest.mark.parametrize("payload", [{}, {"vulns": []}])
+def test_an_empty_result_is_a_successful_clean_answer(payload):
+    """OSV returns {} or {"vulns": []} depending on the service version. Both
+    mean 'nothing known against this' -- which is what §3.3.2 says a clean
+    result means, not a failure."""
+    respx.post(OSV_QUERY_URL).respond(200, json=payload)
+    result = collect_osv(REF)
+    assert result.ok is True
+    assert result.vulnerabilities == []
+    assert result.error is None
+
+
+@respx.mock
+@pytest.mark.parametrize("response,fragment", [
+    (httpx.Response(503), "503"),
+    (httpx.Response(500), "500"),
+    (httpx.Response(429), "429"),
+    (httpx.Response(200, text="<html>captive portal</html>"), "non-JSON"),
+    (httpx.Response(200, json=[]), "not a JSON object"),
+])
+def test_a_failure_is_not_a_clean_answer(response, fragment):
+    """The pair that IS the §9.1 invariant. Same empty vulnerabilities list as
+    the test above; only `ok` tells them apart."""
+    respx.post(OSV_QUERY_URL).mock(return_value=response)
+    result = collect_osv(REF)
+    assert result.ok is False
+    assert result.vulnerabilities == []
+    assert fragment in result.error
+
+
+@respx.mock
+@pytest.mark.parametrize("exc,fragment", [
+    (httpx.ConnectTimeout("boom"), "timeout"),
+    (httpx.ReadTimeout("boom"), "timeout"),
+    (httpx.ConnectError("boom"), "network error"),
+])
+def test_transport_errors_are_return_values(exc, fragment):
+    respx.post(OSV_QUERY_URL).mock(side_effect=exc)
+    result = collect_osv(REF)
+    assert result.ok is False and fragment in result.error
+
+
+@respx.mock
+def test_pagination_is_followed():
+    respx.post(OSV_QUERY_URL).mock(side_effect=[
+        httpx.Response(200, json={"vulns": [_vuln(id="A")], "next_page_token": "t"}),
+        httpx.Response(200, json={"vulns": [_vuln(id="B")]}),
+    ])
+    result = collect_osv(REF)
+    assert [v.id for v in result.vulnerabilities] == ["A", "B"]
+    assert result.ok is True and result.error is None
+
+
+@respx.mock
+def test_truncation_is_reported_rather_than_hidden():
+    respx.post(OSV_QUERY_URL).respond(
+        200, json={"vulns": [_vuln()], "next_page_token": "forever"})
+    result = collect_osv(REF)
+    assert result.ok is True          
+    assert "truncated" in result.error   

@@ -167,3 +167,50 @@ def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulne
             source=source,
         ))
     return out
+
+def query(ref: PackageRef, client: httpx.Client | None = None) -> RawResult:
+    """One POST (or a few, if paginated). Returns the raw payload.
+
+    Raw, not parsed: M1 Step 1.4 caches exactly this, because parsers change
+    weekly during development and cached raw responses survive that.
+    """
+    body = {"version": ref.version,
+            "package": {"name": ref.name, "ecosystem": ref.ecosystem}}
+    owned = client is None
+    client = client or httpx.Client(timeout=TIMEOUT, headers=HEADERS)
+    vulns: list = []
+    token: str | None = None
+    try:
+        for _ in range(MAX_PAGES):
+            page = dict(body, page_token=token) if token else body
+            response = client.post(OSV_QUERY_URL, json=page)
+            # Unlike resolve(), there is no 404 branch here: a package with no
+            # advisories comes back 200 with an empty body. Every non-200 is a
+            # failure to reach OSV.
+            if response.status_code != 200:
+                return RawResult(False, error=f"{response.status_code} from api.osv.dev")
+            try:
+                payload = response.json()
+            except ValueError:
+                return RawResult(False, error="non-JSON response from api.osv.dev")
+            if not isinstance(payload, dict):
+                return RawResult(False, error="response was not a JSON object")
+            vulns.extend(_as_list(payload.get("vulns")))
+            token = payload.get("next_page_token")
+            if not isinstance(token, str) or not token:
+                return RawResult(True, {"vulns": vulns})
+        # Out of pages with a token still outstanding. We have an answer and it
+        # is incomplete -- ok=True, but the gap is named so it surfaces as a
+        # degraded source. Silently truncating is the §9.1 violation arriving
+        # through a side door.
+        return RawResult(True, {"vulns": vulns},
+                         f"results truncated after {MAX_PAGES} pages")
+    except httpx.TimeoutException:
+        # BEFORE RequestError: TimeoutException subclasses TransportError
+        # subclasses RequestError. Reversing these makes this branch dead code.
+        return RawResult(False, error="timeout after 8s")
+    except httpx.RequestError as exc:
+        return RawResult(False, error=f"network error: {type(exc).__name__}")
+    finally:
+        if owned:
+            client.close()
