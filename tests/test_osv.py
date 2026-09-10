@@ -35,3 +35,105 @@ from openshield.collect.osv import _word
 ])
 def test_word(value, expected):
     assert _word(value) == expected
+
+@pytest.mark.parametrize("vuln,expected", [
+    # tier 1 -- the publisher's word, and the casefold
+    (_vuln(database_specific={"severity": "HIGH"}), "high"),
+    (_vuln(database_specific={"severity": "MODERATE"}), "moderate"),
+    # tier 2 -- same word, per affected package
+    (_vuln(affected=[{"database_specific": {"severity": "LOW"}}]), "low"),
+    # tier 3 -- a CVSS vector
+    (_vuln(severity=[{"type": "CVSS_V3",
+                      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]),
+     "critical"),
+    # CVSS says MEDIUM, we say moderate
+    (_vuln(severity=[{"type": "CVSS_V3",
+                      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"}]),
+     "moderate"),
+    # misses
+    (_vuln(), "unknown"),
+    (_vuln(database_specific={"severity": "SEVERE"}), "unknown"),
+    (_vuln(severity=[]), "unknown"),
+    # wrong shapes -- the tests that actually matter
+    (_vuln(database_specific="HIGH"), "unknown"),
+    (_vuln(severity={"score": "CVSS:3.1/…"}), "unknown"),
+    (_vuln(affected="not-a-list"), "unknown"),
+])
+def test_severity_of(vuln, expected):
+    assert severity_of(vuln) == expected
+
+
+# Shapes taken from the 2026-09-10 survey rather than invented. Each one is a
+# real advisory whose structure would have broken a plausible implementation.
+V4_ONLY = "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N"
+V31_MODERATE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L"
+
+
+@pytest.mark.parametrize("vuln,expected", [
+    # GHSA-8hc4-vh64-cxmj: a word and NO vector at all. Proves tier 3 cannot
+    # substitute for tier 1 -- dropping tier 1 as "redundant with the vector"
+    # would score this finding unknown and weight it zero.
+    (_vuln(database_specific={"severity": "HIGH"}, severity=[]), "high"),
+    # GHSA-42h9-826w-cgv3: a word, and only a v4 vector base_score declines.
+    (_vuln(database_specific={"severity": "MODERATE"},
+           severity=[{"type": "CVSS_V4", "score": V4_ONLY}]), "moderate"),
+])
+def test_severity_of_real_shapes(vuln, expected):
+    assert severity_of(vuln) == expected
+
+
+@pytest.mark.parametrize("vectors", [
+    [{"type": "CVSS_V3", "score": V31_MODERATE}, {"type": "CVSS_V4", "score": V4_ONLY}],
+    # THE ordering case: v4 first. GHSA-xxjr-mmjv-4gpg carries both, and the
+    # order in the list is not guaranteed. A loop that stopped at the first
+    # entry base_score() declined would return "unknown" for this record.
+    [{"type": "CVSS_V4", "score": V4_ONLY}, {"type": "CVSS_V3", "score": V31_MODERATE}],
+])
+def test_tier_three_continues_past_a_vector_it_cannot_parse(vectors):
+    assert severity_of(_vuln(severity=vectors)) == "moderate"
+
+
+def test_a_v4_only_record_with_no_word_is_unknown_not_a_crash():
+    """The recorded gap in NOTES-0_4 §8.1, pinned as a test so it stays a
+    deliberate limitation rather than becoming a surprise. If v4 support ever
+    lands, this test is the one that should fail."""
+    assert severity_of(_vuln(severity=[{"type": "CVSS_V4", "score": V4_ONLY}])) == "unknown"
+
+
+def test_the_top_level_word_wins_over_the_affected_one():
+    """Pins the ordering, so a refactor that reorders the tiers is visible."""
+    vuln = _vuln(
+        database_specific={"severity": "CRITICAL"},
+        affected=[{"database_specific": {"severity": "LOW"}}],
+    )
+    assert severity_of(vuln) == "critical"
+
+
+def _affected(ecosystem="npm", name="axios", fixed=("1.7.3",)):
+    return {"package": {"ecosystem": ecosystem, "name": name},
+            "ranges": [{"type": "SEMVER",
+                        "events": [{"introduced": "0"}, *({"fixed": f} for f in fixed)]}]}
+
+
+@pytest.mark.parametrize("vuln,expected", [
+    (_vuln(affected=[_affected()]), ["1.7.3"]),
+    # two maintained branches -- genuinely two fixed versions
+    (_vuln(affected=[_affected(fixed=("1.9.1",)), _affected(fixed=("2.0.3",))]),
+     ["1.9.1", "2.0.3"]),
+    # a different package in the same advisory
+    (_vuln(affected=[_affected(name="lodash")]), []),
+    # THE ecosystem bug: same name, different ecosystem
+    (_vuln(affected=[_affected(ecosystem="PyPI")]), []),
+    # no fix published -- an empty list is a fact, not a failure
+    (_vuln(affected=[{"package": {"ecosystem": "npm", "name": "axios"},
+                      "ranges": [{"events": [{"introduced": "0"}]}]}]), []),
+    # deduped
+    (_vuln(affected=[_affected(fixed=("1.7.3",)), _affected(fixed=("1.7.3",))]),
+     ["1.7.3"]),
+    # wrong shapes
+    (_vuln(affected=[{"package": "axios"}]), []),
+    (_vuln(affected=[_affected() | {"ranges": "nope"}]), []),
+    (_vuln(), []),
+])
+def test_fixed_versions(vuln, expected):
+    assert fixed_versions(vuln, REF) == expected
