@@ -240,3 +240,27 @@ def test_truncation_is_reported_rather_than_hidden():
     result = collect_osv(REF)
     assert result.ok is True          
     assert "truncated" in result.error   
+
+def test_all_sources_failed_is_not_a_clean_result():
+    """§15: 'All sources failed -> exit 12, not "no vulnerabilities"'. The
+    failure mode that makes the tool actively harmful. run.py applies
+    offline_policy to this; the collector's job is to make it distinguishable."""
+    from openshield.collect import _evidence
+    ev = _evidence(REF, SourceResult(False, source=SOURCE, error="503 from api.osv.dev"))
+    assert ev.sources == []
+    assert ev.partial is True
+    assert ev.degraded_sources == ["osv: 503 from api.osv.dev"]
+    assert ev.vulnerabilities == []
+
+
+def test_a_clean_result_is_not_partial():
+    from openshield.collect import _evidence
+    ev = _evidence(REF, SourceResult(True, [], SOURCE))
+    assert ev.sources == [SOURCE] and ev.partial is False
+
+
+@respx.mock
+def test_collect_opens_one_client_for_the_batch(client_spy):
+    respx.post(OSV_QUERY_URL).respond(200, json={})
+    collect([REF, PackageRef(name="lodash", version="4.17.21")])
+    assert len(client_spy) == 1

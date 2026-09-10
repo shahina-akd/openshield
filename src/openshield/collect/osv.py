@@ -104,10 +104,6 @@ def severity_of(vuln: dict) -> Severity:
         if word:
             return word
 
-    # CONTINUE past a vector we cannot parse -- do not stop at the first entry.
-    # Records carry several vectors and the order is not guaranteed: a list of
-    # [CVSS_V4, CVSS_V3] still has a usable score in it, and base_score()
-    # declines v4. Observed on GHSA-xxjr-mmjv-4gpg among others.
     for entry in _as_list(vuln.get("severity")):
         score = cvss.base_score(_dig(entry, "score"))
         if score is not None:
@@ -147,15 +143,10 @@ def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulne
     for vuln in _as_list(payload.get("vulns")):
         if not isinstance(vuln, dict):
             continue
-        # A retracted advisory is a false positive, and false positives erode
-        # exactly the attention §3.3.4 says the score exists to direct.
         if vuln.get("withdrawn"):
             continue
         identifier = vuln.get("id")
         if not isinstance(identifier, str) or not identifier:
-            # Unciteable. §4 requires every number to trace to a named
-            # evidence field; a finding with no ID cannot be displayed or
-            # looked up, so showing it would be worse than dropping it.
             continue
         summary = vuln.get("summary")
         out.append(Vulnerability(
@@ -184,9 +175,6 @@ def query(ref: PackageRef, client: httpx.Client | None = None) -> RawResult:
         for _ in range(MAX_PAGES):
             page = dict(body, page_token=token) if token else body
             response = client.post(OSV_QUERY_URL, json=page)
-            # Unlike resolve(), there is no 404 branch here: a package with no
-            # advisories comes back 200 with an empty body. Every non-200 is a
-            # failure to reach OSV.
             if response.status_code != 200:
                 return RawResult(False, error=f"{response.status_code} from api.osv.dev")
             try:
@@ -199,18 +187,23 @@ def query(ref: PackageRef, client: httpx.Client | None = None) -> RawResult:
             token = payload.get("next_page_token")
             if not isinstance(token, str) or not token:
                 return RawResult(True, {"vulns": vulns})
-        # Out of pages with a token still outstanding. We have an answer and it
-        # is incomplete -- ok=True, but the gap is named so it surfaces as a
-        # degraded source. Silently truncating is the §9.1 violation arriving
-        # through a side door.
         return RawResult(True, {"vulns": vulns},
                          f"results truncated after {MAX_PAGES} pages")
     except httpx.TimeoutException:
-        # BEFORE RequestError: TimeoutException subclasses TransportError
-        # subclasses RequestError. Reversing these makes this branch dead code.
         return RawResult(False, error="timeout after 8s")
     except httpx.RequestError as exc:
         return RawResult(False, error=f"network error: {type(exc).__name__}")
     finally:
         if owned:
             client.close()
+
+def collect_osv(ref: PackageRef, client: httpx.Client | None = None) -> SourceResult:
+    source = SourceRef(name=SOURCE_NAME, fetched_at=datetime.now(timezone.utc))
+    try:
+        raw = query(ref, client)
+        if not raw.ok:
+            return SourceResult(False, source=source, error=raw.error)
+        return SourceResult(True, parse_vulns(raw.payload, ref, source),
+                            source, raw.error)
+    except Exception as exc:
+        return SourceResult(False, source=source, error=f"{type(exc).__name__}: {exc}")
