@@ -141,3 +141,29 @@ def fixed_versions(vuln: dict, ref: PackageRef) -> list[str]:
                 if isinstance(value, str) and value and value not in out:
                     out.append(value)
     return out
+
+def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulnerability]:
+    out: list[Vulnerability] = []
+    for vuln in _as_list(payload.get("vulns")):
+        if not isinstance(vuln, dict):
+            continue
+        # A retracted advisory is a false positive, and false positives erode
+        # exactly the attention §3.3.4 says the score exists to direct.
+        if vuln.get("withdrawn"):
+            continue
+        identifier = vuln.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            # Unciteable. §4 requires every number to trace to a named
+            # evidence field; a finding with no ID cannot be displayed or
+            # looked up, so showing it would be worse than dropping it.
+            continue
+        summary = vuln.get("summary")
+        out.append(Vulnerability(
+            id=identifier,
+            aliases=[a for a in _as_list(vuln.get("aliases")) if isinstance(a, str)],
+            summary=summary if isinstance(summary, str) else None,
+            severity=severity_of(vuln),
+            fixed_versions=fixed_versions(vuln, ref),
+            source=source,
+        ))
+    return out

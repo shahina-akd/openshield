@@ -137,3 +137,31 @@ def _affected(ecosystem="npm", name="axios", fixed=("1.7.3",)):
 ])
 def test_fixed_versions(vuln, expected):
     assert fixed_versions(vuln, REF) == expected
+
+JUNK = [
+    {}, {"vulns": None}, {"vulns": "nope"}, {"vulns": [None, 3, "x"]},
+    {"vulns": [{}]}, {"vulns": [{"id": 7}]}, {"vulns": [{"id": ""}]},
+    {"vulns": [{"id": "X", "affected": "not-a-list"}]},
+    {"vulns": [{"id": "X", "aliases": "CVE-1"}]},
+    {"vulns": [{"id": "X", "summary": {"text": "no"}}]},
+    {"vulns": [{"id": "X", "affected": [{"ranges": [{"events": {}}]}]}]},
+    {"vulns": [{"id": "X", "database_specific": None, "severity": None}]},
+]
+
+
+@pytest.mark.parametrize("payload", JUNK)
+def test_parse_never_raises(payload):
+    """Worth more than any individual severity row. This is the property that
+    survives OSV changing its schema -- and the direct analogue of the
+    wrongly-shaped-JSON bug resolve() had."""
+    assert isinstance(parse_vulns(payload, REF, SOURCE), list)
+
+
+def test_withdrawn_advisories_are_dropped():
+    payload = {"vulns": [_vuln(withdrawn="2023-01-01T00:00:00Z"), _vuln(id="GHSA-live")]}
+    assert [v.id for v in parse_vulns(payload, REF, SOURCE)] == ["GHSA-live"]
+
+
+def test_every_vulnerability_carries_the_source_that_found_it():
+    payload = {"vulns": [_vuln()]}
+    assert parse_vulns(payload, REF, SOURCE)[0].source == SOURCE
