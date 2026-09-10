@@ -1,4 +1,8 @@
-"""Shared test fixtures."""
+"""Shared test fixtures.
+
+Two things live here, both of which are wanted by more than one test file:
+the network guard (SPEC §15) and the client-construction spy.
+"""
 import socket
 
 import httpx
