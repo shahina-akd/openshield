@@ -1,6 +1,6 @@
 from typing import get_args
 from openshield.models import RiskLevel, Severity
-from openshield.score import _WEIGHTS
+from openshield.score import _WEIGHTS, _at_least
 
 
 def test_every_severity_has_a_weight():
@@ -14,3 +14,9 @@ def test_every_severity_has_a_weight():
     one.
     """
     assert set(_WEIGHTS) == set(get_args(Severity))
+
+def test_the_override_raises_but_never_lowers():
+    below = _at_least("medium", "high")
+    at = _at_least("high", "high")
+    above = _at_least("critical", "high")
+    assert (below, at, above) == ("high", "high", "critical")
