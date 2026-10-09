@@ -92,3 +92,19 @@ def client_spy(monkeypatch):
 def async_client_spy(monkeypatch):
     """Async httpx.AsyncClient constructions -- collect()'s pool."""
     return _spy_on(monkeypatch, httpx.AsyncClient)
+
+
+@pytest.fixture(autouse=True)
+def isolated_cache(monkeypatch, tmp_path):
+    """Every test gets an empty cache in its own temp directory.
+
+    Without this, tests read and write ~/.openshield/cache.db -- so a test
+    passes or fails depending on whether you ran the tool that morning, which
+    is the definition of a test you cannot trust. It also means the FIRST run
+    of a suite behaves differently from the second.
+
+    Same rule M2 applies to the shim directory: a test never touches the real
+    HOME. The override is read inside cache_path() on every call, so pointing
+    the env var at tmp_path is enough -- no module state to reset.
+    """
+    monkeypatch.setenv("OPENSHIELD_CACHE_DB", str(tmp_path / "cache.db"))

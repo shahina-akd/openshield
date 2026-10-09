@@ -15,10 +15,12 @@ degradation test would go green against unpatched production code.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import httpx
 
-from ..models import Evidence, PackageRef
+from .. import cache
+from ..models import Evidence, PackageRef, SourceRef
 from . import base, github, npm, osv
 from .base import CollectorResult
 
@@ -50,10 +52,46 @@ async def _collect_all(refs: list[PackageRef]) -> list[Evidence]:
     ]
 
 
+async def _cached(source: str, ref: PackageRef, make_request) -> CollectorResult:
+    """Read-through: hit the cache, else fetch and store on success.
+
+    `make_request` is a CALLABLE, not a coroutine. Calling an async function
+    creates a coroutine immediately -- it does not run it -- so passing
+    `osv.fetch(ref, client)` would build one on every cache HIT and then
+    discard it unawaited, which Python reports as
+    `RuntimeWarning: coroutine 'fetch' was never awaited`. Harmless here, but
+    it means the cache saved nothing: the request object was still constructed.
+    A zero-argument lambda defers creation until there is actually a miss.
+
+    The cache wraps the TRANSPORT half only, which is the whole reason Step 1.1
+    kept transport and parsing separate (NOTES-M1 B.1). Parsing still runs on
+    every request, hit or miss -- which is what keeps the age integers correct
+    (B.2).
+
+    SUCCESSES ONLY are stored (B.3). A cached 503 is a source that stays broken
+    for a day after it recovered, and `from_cache=True` on a failure would
+    render as 'as of nine hours ago' about something that never succeeded.
+    """
+    hit = cache.get(source, ref.canonical)
+    if hit is not None:
+        return CollectorResult(
+            ok=True, data=hit,
+            source=SourceRef(name=source, fetched_at=datetime.now(timezone.utc),
+                             from_cache=True),
+        )
+
+    result = await make_request()
+    if result.ok and result.data:
+        cache.put(source, ref.canonical, result.data)
+    return result
+
+
 async def _collect_one(ref: PackageRef, client: httpx.AsyncClient) -> Evidence:
     # WAVE 1 -- independent, concurrent. gather protects each from the other.
     osv_raw, npm_raw = await asyncio.gather(
-        osv.fetch(ref, client), npm.fetch(ref, client), return_exceptions=True
+        _cached(base.NAME_OSV, ref, lambda: osv.fetch(ref, client)),
+        _cached(base.NAME_NPM, ref, lambda: npm.fetch(ref, client)),
+        return_exceptions=True,
     )
     osv_result = base._survive(osv_raw)
     npm_result = base._survive(npm_raw)
@@ -76,7 +114,10 @@ async def _collect_one(ref: PackageRef, client: httpx.AsyncClient) -> Evidence:
         try:
             # npm_result.ok travels with the parsed registry so fetch_for can
             # tell a failed lookup from an unreadable 200 (D.3).
-            gh_result = await github.fetch_for(registry, npm_result.ok, ref, client)
+            gh_result = await _cached(
+                base.NAME_GITHUB, ref,
+                lambda: github.fetch_for(registry, npm_result.ok, ref, client),
+            )
         except Exception as exc:        # Exception only -- see base._survive
             gh_result = base._survive(exc)
 
