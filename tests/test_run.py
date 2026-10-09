@@ -30,6 +30,8 @@ def mocked_registry_and_osv(respx_mock):
     respx_mock.post("https://api.osv.dev/v1/query").respond(
         200, json={"vulns": [{"id": "GHSA-x",
                               "database_specific": {"severity": "HIGH"}}]})
+    respx_mock.get(url__regex=r".*api\.npmjs\.org/.*").respond(
+        200, json={"downloads": 51_000_000})
 
 
 def test_reject_never_calls_execute(never_npm, monkeypatch, mocked_registry_and_osv):
@@ -63,13 +65,18 @@ def test_ci_env_counts_as_no_tty(monkeypatch):
 
 def test_all_sources_failed_refuses(never_npm, monkeypatch, respx_mock):
     """§15: 'All sources failed -> exit 12, not "no vulnerabilities".' Here the
-    consequence is behavioural rather than cosmetic: fail-closed."""
-    respx_mock.get(url__regex=r".*registry\.npmjs\.org/.*").respond(
-        json={"name": "axios", "dist-tags": {"latest": "1.7.2"}, "versions": {"1.7.2": {}}})
+    consequence is behavioural rather than cosmetic: fail-closed.
+
+    EVERY evidence host must fail, not just OSV. This test was written in Step
+    0.7 when npm and GitHub were skeletons that skipped; Step 1.2 made the
+    registry a real source, so mocking OSV alone leaves npm answering and the
+    branch correctly does not fire. Step 1.3 adds api.github.com to this list.
+    """
+    respx_mock.get(url__regex=r".*registry\.npmjs\.org/.*").respond(503)
+    respx_mock.get(url__regex=r".*api\.npmjs\.org/.*").respond(503)
     respx_mock.post("https://api.osv.dev/v1/query").respond(503)
     monkeypatch.setattr("openshield.run.is_interactive", lambda: True)
     assert run_intercept(["npm", "install", "axios"]) == POLICY_BLOCKED
-
 
 def test_an_all_unresolvable_command_still_reaches_the_prompt(monkeypatch, npm_spy):
     """unresolvable_policy defaults to 'prompt' (§11.1). The empty-refs guard
