@@ -6,6 +6,7 @@ from .models import PackageRef, Unresolvable
 from .render import render_assessment, render_unresolvable
 from .resolve import resolve_all
 from .score import score
+from .run import run_intercept
 
 app = typer.Typer()
 
@@ -58,3 +59,9 @@ def check(specs: list[str] = typer.Argument(..., help="npm package specifiers"))
         for r in results
     ]
     typer.echo("\n\n".join(blocks))
+
+
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def intercept(ctx: typer.Context):
+    """The full loop: analyze, prompt, run or refuse. Invoked by the M2 shim."""
+    raise typer.Exit(code=run_intercept(ctx.args))
