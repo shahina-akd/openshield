@@ -1,71 +1,30 @@
-"""The OSV collector. PackageRef in, Vulnerability list out.
+"""The OSV collector. PackageRef in, raw payload out; parse_vulns is separate.
 
-Never raises past collect_osv(). That is Step 1.1's rule, adopted a milestone
-early: it costs one try/except now and makes 1.1 a move rather than a rewrite.
+M1 Step 1.1 converted the transport to async. parse_vulns and the extraction
+helpers are UNCHANGED from M0 -- which is the payoff of keeping transport and
+parsing split (NOTES-M1 B.1): the async conversion rewrote only fetch(), and
+M1 Step 1.4's cache will wrap only fetch().
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
-from . import cvss
 
 import httpx
 
 from ..models import PackageRef, Severity, SourceRef, Vulnerability
+from . import base, cvss
+from .base import CollectorResult, _as_list, _dig
 
 OSV_QUERY_URL = "https://api.osv.dev/v1/query"
-TIMEOUT = httpx.Timeout(8.0)
-HEADERS = {"User-Agent": "openshield/0.1"}
-SOURCE_NAME = "osv"
 MAX_PAGES = 5
 
 
-@dataclass(frozen=True)
-class RawResult:
-    """Transport outcome. `payload` is the raw response -- M1 Step 1.4 caches
-    exactly this, which is why parsing happens elsewhere."""
-    ok: bool
-    payload: dict = field(default_factory=dict)
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class SourceResult:
-    """What one collector contributes to one package's Evidence.
-
-    `ok` and emptiness are SEPARATE facts. ok=False means we could not reach
-    OSV; an empty `vulnerabilities` list with ok=True means OSV said there is
-    nothing known. Conflating them is the §9.1 invariant violation that makes
-    the tool actively harmful.
-
-    ok=True with a non-None error is legitimate: it means "I got an answer and
-    it was incomplete" (see MAX_PAGES).
-    """
-    ok: bool
-    vulnerabilities: list[Vulnerability] = field(default_factory=list)
-    source: SourceRef | None = None
-    error: str | None = None
-
-
-def _as_list(value: object) -> list:
-    """A list, or an empty one. Never raises, never returns None."""
-    return value if isinstance(value, list) else []
-
-
-def _dig(obj: object, *keys: str) -> object | None:
-    """obj['a']['b'] without assuming either level is a dict."""
-    for key in keys:
-        if not isinstance(obj, dict):
-            return None
-        obj = obj.get(key)
-    return obj
-
+# ------------------------------ severity words ---------------------------------
 
 # GHSA says MODERATE. CVSS says MEDIUM. §9.1 says moderate. Both publisher
 # words map onto our vocabulary; missing the CVSS spelling means every
 # CVSS-derived medium finding silently lands on "unknown" and scores zero.
-_WORDS = {
+_WORDS: dict[str, Severity] = {
     "critical": "critical",
     "high": "high",
     "moderate": "moderate",
@@ -77,13 +36,14 @@ _WORDS = {
 def _word(value: object) -> Severity | None:
     """A publisher's severity word, or None if it is not one we recognise.
 
-    An unrecognised word is not a severity -- SEVERE, IMPORTANT, or a private
-    label falls through to the next tier and eventually to "unknown". No fuzzy
-    matching: "unknown" is honest, a guess is not.
+    No fuzzy matching: "unknown" is honest, a guess is not.
     """
     if not isinstance(value, str):
         return None
     return _WORDS.get(value.strip().casefold())
+
+
+# -------------------------------- extraction -----------------------------------
 
 def severity_of(vuln: dict) -> Severity:
     """OSV publishes severity in three places because three parties disagree.
@@ -106,10 +66,13 @@ def severity_of(vuln: dict) -> Severity:
         if word:
             return word
 
+    # CONTINUE past a vector we cannot parse -- do not stop at the first entry.
+    # Records carry several vectors in no guaranteed order: [CVSS_V4, CVSS_V3]
+    # still has a usable score in it, and base_score() declines v4.
     for entry in _as_list(vuln.get("severity")):
         score = cvss.base_score(_dig(entry, "score"))
         if score is not None:
-            return cvss.band(score)
+            return cvss.band(score)  # type: ignore[return-value]
 
     return "unknown"
 
@@ -118,11 +81,7 @@ def fixed_versions(vuln: dict, ref: PackageRef) -> list[str]:
     """Every 'fixed' event for THIS package, in record order, deduped.
 
     The ecosystem check is not tidiness: one advisory can carry affected[]
-    entries for several ecosystems, and package names collide across them
-    freely. Without it you can pull a PyPI fix version into an npm finding --
-    and in M1 that moves the score, because §9.4 grants +5 only when every
-    critical/high vulnerability has a fix.
-
+    entries for several ecosystems, and package names collide across them.
     Comparing against ref.ecosystem rather than a literal "npm" keeps adding
     PyPI a type error rather than a filter that silently matches nothing.
     """
@@ -133,23 +92,27 @@ def fixed_versions(vuln: dict, ref: PackageRef) -> list[str]:
             continue
         if pkg.get("ecosystem") != ref.ecosystem or pkg.get("name") != ref.name:
             continue
-        for rng in _as_list(affected.get("ranges")):
+        for rng in _as_list(_dig(affected, "ranges")):
             for event in _as_list(_dig(rng, "events")):
                 value = _dig(event, "fixed")
                 if isinstance(value, str) and value and value not in out:
                     out.append(value)
     return out
 
+
 def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulnerability]:
+    """PURE: dict in, models out. Never raises. Unchanged by the async move."""
     out: list[Vulnerability] = []
-    for vuln in _as_list(payload.get("vulns")):
+    for vuln in _as_list(_dig(payload, "vulns")):
         if not isinstance(vuln, dict):
             continue
+        # A retracted advisory is a false positive, and false positives erode
+        # exactly the attention §3.3.4 says the score exists to direct.
         if vuln.get("withdrawn"):
             continue
         identifier = vuln.get("id")
         if not isinstance(identifier, str) or not identifier:
-            continue
+            continue          # unciteable -- §4 needs a named evidence field
         summary = vuln.get("summary")
         out.append(Vulnerability(
             id=identifier,
@@ -161,51 +124,63 @@ def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulne
         ))
     return out
 
-def query(ref: PackageRef, client: httpx.Client | None = None) -> RawResult:
-    """One POST (or a few, if paginated). Returns the raw payload.
 
-    Raw, not parsed: M1 Step 1.4 caches exactly this, because parsers change
+# -------------------------------- transport ------------------------------------
+
+async def fetch(ref: PackageRef, client: httpx.AsyncClient) -> CollectorResult:
+    """POST the query (following pagination). Returns the RAW payload.
+
+    Raw, not parsed: Step 1.4 caches exactly this, because parsers change
     weekly during development and cached raw responses survive that.
+
+    Never raises an Exception -- the never-raises rule, adopted in M0. A
+    BaseException (Ctrl-C, the test suite's network guard) is left alone and
+    propagates, which is what `except Exception` rather than a bare except is
+    for.
     """
+    try:
+        return await _query(ref, client)
+    except httpx.TimeoutException:
+        # BEFORE RequestError: TimeoutException subclasses TransportError
+        # subclasses RequestError. Reversed, this branch is dead code.
+        return CollectorResult(ok=False, error="timeout after 8s")
+    except httpx.RequestError as exc:
+        return CollectorResult(ok=False, error=f"network error: {type(exc).__name__}")
+    except Exception as exc:
+        return CollectorResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+
+async def _query(ref: PackageRef, client: httpx.AsyncClient) -> CollectorResult:
     body = {"version": ref.version,
             "package": {"name": ref.name, "ecosystem": ref.ecosystem}}
-    owned = client is None
-    client = client or httpx.Client(timeout=TIMEOUT, headers=HEADERS)
     vulns: list = []
     token: str | None = None
-    try:
-        for _ in range(MAX_PAGES):
-            page = dict(body, page_token=token) if token else body
-            response = client.post(OSV_QUERY_URL, json=page)
-            if response.status_code != 200:
-                return RawResult(False, error=f"{response.status_code} from api.osv.dev")
-            try:
-                payload = response.json()
-            except ValueError:
-                return RawResult(False, error="non-JSON response from api.osv.dev")
-            if not isinstance(payload, dict):
-                return RawResult(False, error="response was not a JSON object")
-            vulns.extend(_as_list(payload.get("vulns")))
-            token = payload.get("next_page_token")
-            if not isinstance(token, str) or not token:
-                return RawResult(True, {"vulns": vulns})
-        return RawResult(True, {"vulns": vulns},
-                         f"results truncated after {MAX_PAGES} pages")
-    except httpx.TimeoutException:
-        return RawResult(False, error="timeout after 8s")
-    except httpx.RequestError as exc:
-        return RawResult(False, error=f"network error: {type(exc).__name__}")
-    finally:
-        if owned:
-            client.close()
 
-def collect_osv(ref: PackageRef, client: httpx.Client | None = None) -> SourceResult:
-    source = SourceRef(name=SOURCE_NAME, fetched_at=datetime.now(timezone.utc))
-    try:
-        raw = query(ref, client)
-        if not raw.ok:
-            return SourceResult(False, source=source, error=raw.error)
-        return SourceResult(True, parse_vulns(raw.payload, ref, source),
-                            source, raw.error)
-    except Exception as exc:
-        return SourceResult(False, source=source, error=f"{type(exc).__name__}: {exc}")
+    for _ in range(MAX_PAGES):
+        page = dict(body, page_token=token) if token else body
+        response = await client.post(OSV_QUERY_URL, json=page)
+        # No 404 branch, unlike resolve(): a package with no advisories comes
+        # back 200 with an empty body. Every non-200 is a failure to reach OSV.
+        if response.status_code != 200:
+            return CollectorResult(ok=False, error=f"{response.status_code} from api.osv.dev")
+        try:
+            payload = response.json()
+        except ValueError:
+            return CollectorResult(ok=False, error="non-JSON response from api.osv.dev")
+        if not isinstance(payload, dict):
+            return CollectorResult(ok=False, error="response was not a JSON object")
+        vulns.extend(_as_list(payload.get("vulns")))
+        next_token = payload.get("next_page_token")
+        if not isinstance(next_token, str) or not next_token:
+            return CollectorResult(ok=True, data={"vulns": vulns}, source=_source())
+        token = next_token
+
+    # Out of pages with a token outstanding: an answer, and an incomplete one.
+    # ok=True, but named, so it surfaces as degradation rather than rounding up.
+    return CollectorResult(ok=True, data={"vulns": vulns}, source=_source(),
+                           error=f"results truncated after {MAX_PAGES} pages")
+
+
+def _source() -> SourceRef:
+    # The clock read belongs in a collector (§9.2 bans it in score(), not here).
+    return SourceRef(name=base.NAME_OSV, fetched_at=datetime.now(timezone.utc))

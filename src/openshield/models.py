@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, field_validator, Field, model_validator
+from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Exact semver. This regex is the definition of "an exact version" for the
 # whole project: parse.py uses it to classify, PackageRef uses it to refuse
@@ -80,12 +80,17 @@ class PackageRef(BaseModel):
     def canonical(self) -> str:
         return f"{self.ecosystem}:{self.name}@{self.version}"
 
+
 # Two vocabularies, deliberately different, deliberately not interchangeable.
 # A vulnerability is "moderate" (GHSA's word). A package's risk band is
 # "medium" (§9.5's word). Keeping them as separate Literals makes a mix-up a
 # type error instead of an odd line of output.
 Severity = Literal["critical", "high", "moderate", "low", "unknown"]
 RiskLevel = Literal["critical", "high", "medium", "low"]
+
+# What a human said. M2 adds a Decision RECORD (project, package, version,
+# timestamp, score) -- this is just the verb.
+DecisionAction = Literal["approve", "reject"]
 
 
 def _require_aware(v: datetime) -> datetime:
@@ -104,7 +109,7 @@ class SourceRef(BaseModel):
 
     name: str                      # "osv", "npm-registry", "github"
     fetched_at: datetime
-    from_cache: bool = False       # M1 sets this on a cache hit
+    from_cache: bool = False       # M1 Step 1.4 sets this on a cache hit
 
     @field_validator("fetched_at")
     @classmethod
@@ -126,15 +131,45 @@ class Vulnerability(BaseModel):
     source: SourceRef
 
 
+# ------------------------------ M1 evidence -----------------------------------
+#
+# Every field is `| None`. None means "not collected"; 0 and False mean
+# something was MEASURED. §9.4 must never treat the two alike -- archived=None
+# from a failed fetch must not score the same as archived=False.
+
+class RegistryInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    maintainer_count: int | None = None
+    license: str | None = None
+    weekly_downloads: int | None = None
+    days_since_last_publish: int | None = None     # §9.2: an integer, not a date
+    repository_owner: str | None = None
+    repository_name: str | None = None
+
+
+class RepositoryInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    archived: bool | None = None
+    days_since_last_push: int | None = None
+    contributors: int | None = None
+    stars: int | None = None
+
+
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     package: PackageRef
     vulnerabilities: list[Vulnerability] = []
-    sources: list[SourceRef] = []          # sources that SUCCEEDED
+    registry: RegistryInfo | None = None       # M1 Step 1.2
+    repository: RepositoryInfo | None = None   # M1 Step 1.3
+    sources: list[SourceRef] = []              # sources that SUCCEEDED
     partial: bool = False
-    degraded_sources: list[str] = []       # ["github: 403 rate limited"]
-    # registry / repository land in M1 Step 1.2–1.3 as optional fields.
+    degraded_sources: list[str] = []           # ["github: 403 rate limited"]
+    # Collectors NOT ATTEMPTED -- no token, no repository. Not degradation, so
+    # it never sets `partial`; rendered as a quiet line (NOTES-M1 A.3).
+    unavailable: list[str] = []
 
     @model_validator(mode="after")
     def _partial_names_its_failures(self) -> "Evidence":
@@ -162,6 +197,7 @@ class Assessment(BaseModel):
     # here, never re-derived downstream.
     risk: RiskLevel
     scoring_version: str            # §9.2; stored per-decision by §10.3
+
 
 SpecifierKind = Literal[
     "registry",     # RESOLVABLE: bare name, or exact version

@@ -1,14 +1,30 @@
+"""collect/osv.py -- extraction (pure) and transport (async, via a sync wrapper).
+
+M1 Step 1.1 changed only the transport half: query()/collect_osv() became
+`async def fetch(ref, client) -> CollectorResult`. Everything in sections 1-3
+is unchanged from M0 apart from imports -- that is the payoff of the
+transport/parse split (NOTES-M1 B.1).
+
+The M0 tests of _evidence() and SourceResult moved to test_collect.py, where
+assembly now lives. The _as_list/_dig tests moved to test_base.py.
+
+No test here is async. Transport tests drive fetch() through _fetch(), a small
+sync wrapper around asyncio.run -- the same boundary collect() uses.
+"""
+import asyncio
+import json
 from datetime import datetime, timezone
 
 import httpx
 import pytest
 import respx
-from openshield.collect import _evidence, collect
+
+from openshield.collect import osv
+from openshield.collect.base import CollectorResult
 from openshield.collect.osv import (
     MAX_PAGES,
     OSV_QUERY_URL,
-    SourceResult,
-    collect_osv,
+    _word,
     fixed_versions,
     parse_vulns,
     severity_of,
@@ -21,13 +37,22 @@ REF = PackageRef(name="axios", version="1.7.2")
 
 
 def _vuln(**fields) -> dict:
-    """A minimal OSV record. Hand-written literal dicts, not saved API
-    responses -- M1 Step 1.4 caches raw responses precisely because parsers
-    change weekly, and an eight-line fixture that isolates one extraction path
-    localises a failure in a way a 400-line real advisory does not."""
+    """A minimal OSV record. Hand-written, not a saved API response -- an
+    eight-line fixture isolating one extraction path localises a failure."""
     return {"id": "GHSA-test", **fields}
 
-from openshield.collect.osv import _word
+
+def _fetch(ref: PackageRef = REF) -> CollectorResult:
+    """Drive the async transport synchronously, as collect() does."""
+    async def go():
+        async with httpx.AsyncClient() as client:
+            return await osv.fetch(ref, client)
+    return asyncio.run(go())
+
+
+# ------------------------------------------------------------------------------
+# 1. Severity
+# ------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("value,expected", [
     ("HIGH", "high"), ("high", "high"), ("  Moderate  ", "moderate"),
@@ -36,6 +61,7 @@ from openshield.collect.osv import _word
 ])
 def test_word(value, expected):
     assert _word(value) == expected
+
 
 @pytest.mark.parametrize("vuln,expected", [
     # tier 1 -- the publisher's word, and the casefold
@@ -64,16 +90,18 @@ def test_severity_of(vuln, expected):
     assert severity_of(vuln) == expected
 
 
-# Shapes taken from the 2026-09-10 survey rather than invented. Each one is a
-# real advisory whose structure would have broken a plausible implementation.
+def test_the_top_level_word_wins_over_the_affected_one():
+    vuln = _vuln(database_specific={"severity": "CRITICAL"},
+                 affected=[{"database_specific": {"severity": "LOW"}}])
+    assert severity_of(vuln) == "critical"
+
+
 V4_ONLY = "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:N/VA:L/SC:N/SI:N/SA:N"
 V31_MODERATE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L"
 
 
 @pytest.mark.parametrize("vuln,expected", [
-    # GHSA-8hc4-vh64-cxmj: a word and NO vector at all. Proves tier 3 cannot
-    # substitute for tier 1 -- dropping tier 1 as "redundant with the vector"
-    # would score this finding unknown and weight it zero.
+    # GHSA-8hc4-vh64-cxmj: a word and NO vector at all.
     (_vuln(database_specific={"severity": "HIGH"}, severity=[]), "high"),
     # GHSA-42h9-826w-cgv3: a word, and only a v4 vector base_score declines.
     (_vuln(database_specific={"severity": "MODERATE"},
@@ -85,9 +113,7 @@ def test_severity_of_real_shapes(vuln, expected):
 
 @pytest.mark.parametrize("vectors", [
     [{"type": "CVSS_V3", "score": V31_MODERATE}, {"type": "CVSS_V4", "score": V4_ONLY}],
-    # THE ordering case: v4 first. GHSA-xxjr-mmjv-4gpg carries both, and the
-    # order in the list is not guaranteed. A loop that stopped at the first
-    # entry base_score() declined would return "unknown" for this record.
+    # THE ordering case: v4 first (GHSA-xxjr-mmjv-4gpg carries both).
     [{"type": "CVSS_V4", "score": V4_ONLY}, {"type": "CVSS_V3", "score": V31_MODERATE}],
 ])
 def test_tier_three_continues_past_a_vector_it_cannot_parse(vectors):
@@ -95,20 +121,14 @@ def test_tier_three_continues_past_a_vector_it_cannot_parse(vectors):
 
 
 def test_a_v4_only_record_with_no_word_is_unknown_not_a_crash():
-    """The recorded gap in NOTES-0_4 §8.1, pinned as a test so it stays a
-    deliberate limitation rather than becoming a surprise. If v4 support ever
-    lands, this test is the one that should fail."""
+    """The recorded gap in NOTES-0_4 §8.1, pinned. If v4 support ever lands,
+    this is the test that should fail."""
     assert severity_of(_vuln(severity=[{"type": "CVSS_V4", "score": V4_ONLY}])) == "unknown"
 
 
-def test_the_top_level_word_wins_over_the_affected_one():
-    """Pins the ordering, so a refactor that reorders the tiers is visible."""
-    vuln = _vuln(
-        database_specific={"severity": "CRITICAL"},
-        affected=[{"database_specific": {"severity": "LOW"}}],
-    )
-    assert severity_of(vuln) == "critical"
-
+# ------------------------------------------------------------------------------
+# 2. Fixed versions
+# ------------------------------------------------------------------------------
 
 def _affected(ecosystem="npm", name="axios", fixed=("1.7.3",)):
     return {"package": {"ecosystem": ecosystem, "name": name},
@@ -118,26 +138,26 @@ def _affected(ecosystem="npm", name="axios", fixed=("1.7.3",)):
 
 @pytest.mark.parametrize("vuln,expected", [
     (_vuln(affected=[_affected()]), ["1.7.3"]),
-    # two maintained branches -- genuinely two fixed versions
     (_vuln(affected=[_affected(fixed=("1.9.1",)), _affected(fixed=("2.0.3",))]),
      ["1.9.1", "2.0.3"]),
-    # a different package in the same advisory
     (_vuln(affected=[_affected(name="lodash")]), []),
     # THE ecosystem bug: same name, different ecosystem
     (_vuln(affected=[_affected(ecosystem="PyPI")]), []),
-    # no fix published -- an empty list is a fact, not a failure
     (_vuln(affected=[{"package": {"ecosystem": "npm", "name": "axios"},
                       "ranges": [{"events": [{"introduced": "0"}]}]}]), []),
-    # deduped
     (_vuln(affected=[_affected(fixed=("1.7.3",)), _affected(fixed=("1.7.3",))]),
      ["1.7.3"]),
-    # wrong shapes
     (_vuln(affected=[{"package": "axios"}]), []),
     (_vuln(affected=[_affected() | {"ranges": "nope"}]), []),
     (_vuln(), []),
 ])
 def test_fixed_versions(vuln, expected):
     assert fixed_versions(vuln, REF) == expected
+
+
+# ------------------------------------------------------------------------------
+# 3. parse_vulns
+# ------------------------------------------------------------------------------
 
 JUNK = [
     {}, {"vulns": None}, {"vulns": "nope"}, {"vulns": [None, 3, "x"]},
@@ -147,14 +167,12 @@ JUNK = [
     {"vulns": [{"id": "X", "summary": {"text": "no"}}]},
     {"vulns": [{"id": "X", "affected": [{"ranges": [{"events": {}}]}]}]},
     {"vulns": [{"id": "X", "database_specific": None, "severity": None}]},
+    [], "string", None,                        # not even a dict at the top
 ]
 
 
 @pytest.mark.parametrize("payload", JUNK)
 def test_parse_never_raises(payload):
-    """Worth more than any individual severity row. This is the property that
-    survives OSV changing its schema -- and the direct analogue of the
-    wrongly-shaped-JSON bug resolve() had."""
     assert isinstance(parse_vulns(payload, REF, SOURCE), list)
 
 
@@ -164,33 +182,40 @@ def test_withdrawn_advisories_are_dropped():
 
 
 def test_every_vulnerability_carries_the_source_that_found_it():
-    payload = {"vulns": [_vuln()]}
-    assert parse_vulns(payload, REF, SOURCE)[0].source == SOURCE
+    assert parse_vulns({"vulns": [_vuln()]}, REF, SOURCE)[0].source == SOURCE
+
+
+# ------------------------------------------------------------------------------
+# 4. Transport -- async fetch(), driven synchronously
+# ------------------------------------------------------------------------------
 
 @respx.mock
-def test_query_sends_the_resolved_version():
-    """Appendix B's 'are you scoring the version you resolved, or the version
-    the user typed?' -- asserted mechanically rather than trusted."""
-    import json
+def test_fetch_sends_the_resolved_version():
+    """Appendix B: are you querying the version you resolved, or the version
+    the user typed? Asserted mechanically."""
     route = respx.post(OSV_QUERY_URL).respond(200, json={})
-    collect_osv(REF)
+    _fetch()
     assert json.loads(route.calls.last.request.content) == {
-        "version": "1.7.2",
-        "package": {"name": "axios", "ecosystem": "npm"},
+        "version": "1.7.2", "package": {"name": "axios", "ecosystem": "npm"},
     }
 
 
 @respx.mock
 @pytest.mark.parametrize("payload", [{}, {"vulns": []}])
 def test_an_empty_result_is_a_successful_clean_answer(payload):
-    """OSV returns {} or {"vulns": []} depending on the service version. Both
-    mean 'nothing known against this' -- which is what §3.3.2 says a clean
-    result means, not a failure."""
+    """{} and {"vulns": []} both mean 'nothing known against this'."""
     respx.post(OSV_QUERY_URL).respond(200, json=payload)
-    result = collect_osv(REF)
-    assert result.ok is True
-    assert result.vulnerabilities == []
-    assert result.error is None
+    r = _fetch()
+    assert r.ok is True and r.error is None and r.skipped is False
+    assert r.data == {"vulns": []}
+    assert r.source is not None and r.source.name == "osv"
+
+
+@respx.mock
+def test_fetch_returns_the_raw_payload_not_parsed_models():
+    """Step 1.4 caches exactly what fetch returns, so it must be raw."""
+    respx.post(OSV_QUERY_URL).respond(200, json={"vulns": [_vuln()]})
+    assert _fetch().data == {"vulns": [_vuln()]}
 
 
 @respx.mock
@@ -202,66 +227,42 @@ def test_an_empty_result_is_a_successful_clean_answer(payload):
     (httpx.Response(200, json=[]), "not a JSON object"),
 ])
 def test_a_failure_is_not_a_clean_answer(response, fragment):
-    """The pair that IS the §9.1 invariant. Same empty vulnerabilities list as
-    the test above; only `ok` tells them apart."""
+    """Same empty data as the clean case; only `ok` tells them apart. §9.1."""
     respx.post(OSV_QUERY_URL).mock(return_value=response)
-    result = collect_osv(REF)
-    assert result.ok is False
-    assert result.vulnerabilities == []
-    assert fragment in result.error
+    r = _fetch()
+    assert r.ok is False and r.skipped is False
+    assert r.data == {}
+    assert fragment in r.error
 
 
 @respx.mock
 @pytest.mark.parametrize("exc,fragment", [
     (httpx.ConnectTimeout("boom"), "timeout"),
     (httpx.ReadTimeout("boom"), "timeout"),
-    (httpx.ConnectError("boom"), "network error"),
+    (httpx.ConnectError("boom"), "network error: ConnectError"),
 ])
 def test_transport_errors_are_return_values(exc, fragment):
     respx.post(OSV_QUERY_URL).mock(side_effect=exc)
-    result = collect_osv(REF)
-    assert result.ok is False and fragment in result.error
+    r = _fetch()
+    assert r.ok is False and fragment in r.error
 
 
 @respx.mock
 def test_pagination_is_followed():
-    respx.post(OSV_QUERY_URL).mock(side_effect=[
+    route = respx.post(OSV_QUERY_URL).mock(side_effect=[
         httpx.Response(200, json={"vulns": [_vuln(id="A")], "next_page_token": "t"}),
         httpx.Response(200, json={"vulns": [_vuln(id="B")]}),
     ])
-    result = collect_osv(REF)
-    assert [v.id for v in result.vulnerabilities] == ["A", "B"]
-    assert result.ok is True and result.error is None
+    r = _fetch()
+    assert [v["id"] for v in r.data["vulns"]] == ["A", "B"]
+    assert r.ok is True and r.error is None
+    assert json.loads(route.calls[1].request.content)["page_token"] == "t"
 
 
 @respx.mock
 def test_truncation_is_reported_rather_than_hidden():
     respx.post(OSV_QUERY_URL).respond(
         200, json={"vulns": [_vuln()], "next_page_token": "forever"})
-    result = collect_osv(REF)
-    assert result.ok is True          
-    assert "truncated" in result.error   
-
-def test_all_sources_failed_is_not_a_clean_result():
-    """§15: 'All sources failed -> exit 12, not "no vulnerabilities"'. The
-    failure mode that makes the tool actively harmful. run.py applies
-    offline_policy to this; the collector's job is to make it distinguishable."""
-    from openshield.collect import _evidence
-    ev = _evidence(REF, SourceResult(False, source=SOURCE, error="503 from api.osv.dev"))
-    assert ev.sources == []
-    assert ev.partial is True
-    assert ev.degraded_sources == ["osv: 503 from api.osv.dev"]
-    assert ev.vulnerabilities == []
-
-
-def test_a_clean_result_is_not_partial():
-    from openshield.collect import _evidence
-    ev = _evidence(REF, SourceResult(True, [], SOURCE))
-    assert ev.sources == [SOURCE] and ev.partial is False
-
-
-@respx.mock
-def test_collect_opens_one_client_for_the_batch(client_spy):
-    respx.post(OSV_QUERY_URL).respond(200, json={})
-    collect([REF, PackageRef(name="lodash", version="4.17.21")])
-    assert len(client_spy) == 1
+    r = _fetch()
+    assert r.ok is True
+    assert f"truncated after {MAX_PAGES} pages" in r.error

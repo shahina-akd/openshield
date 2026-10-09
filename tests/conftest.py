@@ -1,7 +1,14 @@
 """Shared test fixtures.
 
-Two things live here, both of which are wanted by more than one test file:
-the network guard (SPEC §15) and the client-construction spy.
+Three things live here, each wanted by more than one test file:
+
+- the network guard (SPEC §15), which must be UNSWALLOWABLE -- see below;
+- client_spy, counting sync httpx.Client constructions;
+- async_client_spy, counting async httpx.AsyncClient constructions.
+
+The spies COUNT POOLS. They do not block traffic -- both call through to the
+real __init__. For "zero network calls" (M1 Step 1.4's cache hit, M2 Step 2.2's
+approved-cache-hit path) rely on the guard, and assert on the evidence too.
 """
 import socket
 
@@ -9,51 +16,79 @@ import httpx
 import pytest
 
 
+class RealNetworkAttempted(BaseException):
+    """Raised when a test tries to reach the real network.
+
+    BaseException, NOT Exception, and that is the whole point of this class.
+
+    Collectors catch Exception by design (the never-raises rule), and
+    asyncio.gather(return_exceptions=True) returns whatever they miss. A guard
+    deriving from Exception is therefore invisible inside collect(): a
+    collector that accidentally reaches the network produces a degraded source
+    line rather than a failing test. NOTES-M1-inheritance.md D.1.
+
+    collect/base.py's _survive and collect/__init__.py's _failed_evidence both
+    re-raise any BaseException that is not an Exception, so this propagates all
+    the way out of collect(). test_collect.py pins that permanently.
+    """
+
+
 @pytest.fixture(autouse=True)
 def no_real_network(monkeypatch):
     """SPEC §15: 'No test touches the network.' Enforced, not conventioned.
 
-    Guards at the socket layer rather than at httpx's transport, because respx
-    intercepts *below* httpx.HTTPTransport -- patching there would block respx's
-    own mocked responses and fail every test in the suite. A mocked request
-    never reaches a socket at all, so this fixture is invisible to it; only a
-    genuine connection attempt trips it.
+    Guards at the socket layer rather than httpx's transport: respx intercepts
+    BELOW httpx.HTTPTransport, so patching there would block respx's own mocked
+    responses. A mocked request never reaches a socket, so this is invisible to
+    it; only a genuine connection attempt trips it.
 
-    Layer-agnostic on purpose: it keeps working if respx changes where it
-    patches, and it catches a real request made through requests, urllib, or
-    anything else that ends up at a socket.
+    getaddrinfo is guarded too, because DNS happens BEFORE connect. Without it,
+    an offline machine fails the lookup first with an ordinary ConnectError --
+    which the collectors catch -- and the guard never fires.
     """
-    def deny(self, *args, **kwargs):
-        raise AssertionError(
+    def deny(*args, **kwargs):
+        raise RealNetworkAttempted(
             "test attempted a real network connection -- add @respx.mock, "
-            "or mock the transport for this test"
+            "or stub the collector"
         )
 
     monkeypatch.setattr(socket.socket, "connect", deny)
     monkeypatch.setattr(socket.socket, "connect_ex", deny)
+    monkeypatch.setattr(socket, "getaddrinfo", deny)
+
+
+def _spy_on(monkeypatch, cls) -> list[dict]:
+    """Record each construction of `cls`, then construct normally.
+
+    Records `self` so tests can assert IDENTITY (every collector received the
+    pool that was built) and LIFECYCLE (the pool was closed), neither of which
+    a count can prove. NOTES-M1-inheritance.md B.13.
+
+    Not positional args: httpx.Client and AsyncClient take keyword-only
+    arguments, so there are none to record.
+    """
+    calls: list[dict] = []
+    original = cls.__init__
+
+    def spy(self, *args, **kwargs):
+        calls.append({"self": self, "kwargs": kwargs})
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "__init__", spy)
+    return calls
 
 
 @pytest.fixture
 def client_spy(monkeypatch):
-    """Records every httpx.Client construction, then constructs normally.
+    """Sync httpx.Client constructions -- resolve_all's pool.
 
-    Asserts a property no request count can: how many connection pools were
-    opened. `resolve_all` and `collect` both exist to open exactly one per
-    command line, and a refactor back to one-per-specifier is invisible to a
-    call-count assertion.
-
-    Yields the list of kwargs each client was built with, so a test can also
-    assert the explicit timeout §17 requires.
-
-    Wanted by: test_resolve.py (resolve_all), test_osv.py (collect), and from
-    M1 Step 1.4 / M2 Step 2.2 the cache-hit and prior-decision paths.
+    Separate from async_client_spy because a command line legitimately builds
+    one of each; a spy conflating them could not say which layer regressed.
     """
-    calls: list[dict] = []
-    original = httpx.Client.__init__
+    return _spy_on(monkeypatch, httpx.Client)
 
-    def spy(self, *args, **kwargs):
-        calls.append(kwargs)
-        original(self, *args, **kwargs)
 
-    monkeypatch.setattr(httpx.Client, "__init__", spy)
-    return calls
+@pytest.fixture
+def async_client_spy(monkeypatch):
+    """Async httpx.AsyncClient constructions -- collect()'s pool."""
+    return _spy_on(monkeypatch, httpx.AsyncClient)
