@@ -144,9 +144,9 @@ def test_the_renderer_cannot_execute_anything():
 # --------------- behavior -------------
 def test_check_never_runs_npm(monkeypatch, respx_mock):
     def explode(*a, **k):
-        raise AssertionError("check invoked npm")
+        raise AssertionError("check spawned a subprocess")
 
-    monkeypatch.setattr("openshield.execute.run_npm", explode)
+    monkeypatch.setattr("subprocess.run", explode)
     respx_mock.get(url__regex=r".*registry\.npmjs\.org/.*").respond(
         json={"name": "axios", "dist-tags": {"latest": "1.7.2"},
               "versions": {"1.7.2": {}}})
