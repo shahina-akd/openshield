@@ -108,3 +108,19 @@ def isolated_cache(monkeypatch, tmp_path):
     the env var at tmp_path is enough -- no module state to reset.
     """
     monkeypatch.setenv("OPENSHIELD_CACHE_DB", str(tmp_path / "cache.db"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(monkeypatch, tmp_path):
+    """Every test sees a fresh, EMPTY config directory.
+
+    Without this, tests read your real ~/.openshield/config.toml -- so a test
+    passes or fails depending on what you configured that morning. Same rule
+    as isolated_cache above, and the same rule M2 applies to the shim
+    directory: a test never touches the real HOME.
+
+    The path is deliberately inside a subdirectory that does not exist yet, so
+    ensure_file() has to create it -- which is the behaviour a new user gets.
+    """
+    monkeypatch.setenv("OPENSHIELD_CONFIG",
+                       str(tmp_path / "openshield" / "config.toml"))

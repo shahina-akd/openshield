@@ -13,6 +13,7 @@ from .parse import classify_invocation
 from .render import render_assessment, render_unresolvable
 from .resolve import resolve_all
 from .score import score
+from . import config
 
 
 def run_intercept(argv: list[str]) -> int:
@@ -71,18 +72,24 @@ def _intercept(argv: list[str]) -> int:
         if isinstance(r, Unresolvable) and r.reason == "network"
     ]
     if unreachable and not refs:
-        print("\n[!!] nothing could be resolved -- refusing "
-              "(offline_policy: fail-closed)")
-        return POLICY_BLOCKED
+        if config.get("offline_policy") == "fail-open":
+            print("\n[!!] nothing could be resolved -- proceeding anyway "
+                  "(offline_policy: fail-open)")
+        else:
+            print("\n[!!] nothing could be resolved -- refusing "
+                  "(offline_policy: fail-closed)")
+            return POLICY_BLOCKED
 
     if refs and all(not e.sources for e in evidence):
-        print("\n[!!] every evidence source failed -- refusing "
-              "(offline_policy: fail-closed)")
-        return POLICY_BLOCKED
+        if config.get("offline_policy") != "fail-open":
+            print("\n[!!] every evidence source failed -- refusing "
+                  "(offline_policy: fail-closed)")
+            return POLICY_BLOCKED
 
     if not is_interactive():
-        print("\n[!!] no TTY -- refusing (noninteractive_policy: deny)")
-        return POLICY_BLOCKED
+        if config.get("noninteractive_policy") != "allow":
+            print("\n[!!] no TTY -- refusing (noninteractive_policy: deny)")
+            return POLICY_BLOCKED
 
     # 6. The pause. ONE prompt for the whole command line (§11.1), not one per
     #    package: you are approving the command you typed. M2 records a

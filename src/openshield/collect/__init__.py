@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .. import cache
+from .. import cache, config
 from ..models import Evidence, PackageRef, SourceRef
 from . import base, github, npm, osv
 from .base import CollectorResult
@@ -72,7 +72,8 @@ async def _cached(source: str, ref: PackageRef, make_request) -> CollectorResult
     for a day after it recovered, and `from_cache=True` on a failure would
     render as 'as of nine hours ago' about something that never succeeded.
     """
-    hit = cache.get(source, ref.canonical)
+    hit = cache.get(source, ref.canonical,
+                    ttl_hours=config.get("cache_ttl_hours"))
     if hit is not None:
         return CollectorResult(
             ok=True, data=hit,
