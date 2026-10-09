@@ -61,8 +61,20 @@ def _intercept(argv: list[str]) -> int:
     ]
     print("\n\n".join(blocks))
 
+
     # 5. Policy. Order matters: offline before TTY, because "I could not
     #    analyze this" is a better message than "I cannot ask you".
+
+    # Network failures during resolution must fail closed.
+    unreachable = [
+        r for r in results
+        if isinstance(r, Unresolvable) and r.reason == "network"
+    ]
+    if unreachable and not refs:
+        print("\n[!!] nothing could be resolved -- refusing "
+              "(offline_policy: fail-closed)")
+        return POLICY_BLOCKED
+
     if refs and all(not e.sources for e in evidence):
         print("\n[!!] every evidence source failed -- refusing "
               "(offline_policy: fail-closed)")
