@@ -185,10 +185,31 @@ class Evidence(BaseModel):
         return self
 
 
+class Contribution(BaseModel):
+    """One line of the score's arithmetic, as it will be displayed.
+
+    §4: every number shown traces to a visible evidence field. The LABEL names
+    the field and its measured value ("published 871 days ago"), so the reader
+    can check the reasoning rather than taking the total on trust.
+
+    Built by score(), never recomputed by render.py. Two implementations of the
+    same arithmetic can disagree, and a breakdown that contradicts its own
+    total is worse than no breakdown -- so these rows ARE the calculation, and
+    their sum is the score (tests/test_score.py pins that).
+    """
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    label: str
+    points: int
+
+
 class Assessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     evidence: Evidence
+    # The arithmetic, in display order, summing to `score`. Empty is legal for
+    # a hand-built Assessment in a test; score() always populates it.
+    contributions: list[Contribution] = []
     # ge/le makes §9.3's clamp structural. A weight change that overflows the
     # scale becomes a loud test failure rather than "137/100 -- low".
     score: int = Field(ge=0, le=100)

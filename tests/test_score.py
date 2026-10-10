@@ -189,7 +189,7 @@ def test_the_same_evidence_scores_identically_twice():
 
 
 def test_the_assessment_is_stamped_with_the_new_version():
-    assert score(ev()).scoring_version == SCORING_VERSION == "0.2.0"
+    assert score(ev()).scoring_version == SCORING_VERSION == "0.2.1"
 
 
 # ------------------------------------------------------------------------------
@@ -444,3 +444,139 @@ def test_score_imports_nothing_that_can_read_the_world():
 
     unexpected = imported - _ALLOWED_IMPORTS
     assert not unexpected, f"score.py must stay pure; unexpected: {unexpected}"
+
+
+# ------------------------------------------------------------------------------
+# 8. The breakdown -- §4's explainability, made arithmetic
+# ------------------------------------------------------------------------------
+
+def _rows(assessment):
+    return {c.label: c.points for c in assessment.contributions}
+
+
+@pytest.mark.parametrize("evidence", [
+    ev(),
+    ev(vuln("high")),
+    ev(*vulns("moderate", 19)),
+    ev(*vulns("critical", 5, fixed=())),                       # clamps at 0
+    ev(registry=HEALTHY_REGISTRY, repository=HEALTHY_REPO),
+    ev(registry=ABANDONED_REGISTRY, repository=ABANDONED_REPO),
+    ev(registry=HEALTHY_REGISTRY, repository=HEALTHY_REPO,
+       partial=True, degraded=["github: 404"]),                # hits the ceiling
+    ev(*vulns("high", 14), *vulns("moderate", 19), vuln("low"),
+       registry=RegistryInfo(maintainer_count=1, license="MIT",
+                             weekly_downloads=114_018_597,
+                             days_since_last_publish=871),
+       repository=RepositoryInfo(archived=False, days_since_last_push=0,
+                                 contributors=674, stars=109_345)),
+])
+def test_the_rows_always_sum_to_the_score(evidence):
+    """THE invariant, and the reason the breakdown is built in score() rather
+    than recomputed in render.py.
+
+    Two implementations of the same arithmetic can disagree, and a table that
+    contradicts its own total is worse than no table -- the reader stops
+    trusting both. These rows ARE the calculation, so the rendered column adds
+    up by construction, including the clamp and the ceiling.
+    """
+    result = score(evidence)
+    assert sum(c.points for c in result.contributions) == result.score
+
+
+def test_every_weight_that_applied_has_a_row():
+    """§4: every number shown traces to a visible evidence field. If a weight
+    could fire without producing a row, the total would be unexplainable --
+    which is the failure the whole breakdown exists to prevent."""
+    result = score(ev(*vulns("high", 14), *vulns("moderate", 19), vuln("low"),
+                      registry=RegistryInfo(maintainer_count=1, license="MIT",
+                                            weekly_downloads=114_018_597,
+                                            days_since_last_publish=871),
+                      repository=RepositoryInfo(archived=False,
+                                                days_since_last_push=0,
+                                                contributors=674)))
+    rows = _rows(result)
+
+    assert rows["starting point"] == 60
+    assert rows["14 high findings (capped at -36)"] == -36
+    assert rows["19 moderate findings (capped at -12)"] == -12
+    assert rows["1 low finding"] == -1
+    assert rows["every serious finding has a published fix"] == 5
+    assert rows["this version published 871 days ago"] == -15
+    assert rows["114,018,597 weekly downloads"] == 10
+    assert rows["a single npm maintainer account"] == -8
+    assert rows["674 repository contributors"] == 8
+    assert result.score == 11          # the observed axios@1.7.2 figure
+
+
+def test_a_signal_that_did_not_apply_has_no_row():
+    """An absent signal must not appear as a zero. A row saying
+    `repository archived  0` would imply we looked and it was fine, which is
+    exactly the None-versus-False confusion A.2 is about."""
+    rows = _rows(score(ev()))
+    assert set(rows) == {"starting point"}
+
+
+def test_unrated_findings_get_a_zero_row_rather_than_vanishing():
+    """`unknown` weighs zero (§9.4), but the header counts it -- so without a
+    row the table would appear to have lost a finding, and a reader checking
+    the arithmetic would distrust the whole column."""
+    rows = _rows(score(ev(vuln("unknown"), vuln("high"))))
+    assert rows["1 unknown finding (not rated)"] == 0
+
+
+def test_a_cap_says_so_on_the_line():
+    """`19 moderate findings` costing 12 points is surprising unless the reason
+    is on the row. An uncapped count must NOT claim a cap."""
+    assert "capped" in str(_rows(score(ev(*vulns("moderate", 19)))))
+    assert "capped" not in str(_rows(score(ev(*vulns("moderate", 2)))))
+
+
+def test_the_clamp_appears_as_its_own_row():
+    """A column that silently failed to add up would undermine every other
+    row. '-22, and the scale stops at 0' is a fact about this package."""
+    result = score(ev(*vulns("critical", 5, fixed=()),
+                      registry=ABANDONED_REGISTRY, repository=ABANDONED_REPO))
+    assert result.score == 0
+    assert any("scale stops at 0" in c.label for c in result.contributions)
+    assert sum(c.points for c in result.contributions) == 0
+
+
+def test_the_partial_ceiling_appears_as_its_own_row_and_says_the_cost():
+    """The most informative row in a degraded result: it tells the reader what
+    the score WOULD have been, so they learn the cap cost something rather
+    than that the package is mediocre."""
+    result = score(ev(registry=HEALTHY_REGISTRY, repository=HEALTHY_REPO,
+                      partial=True, degraded=["github: 404 not found"]))
+    assert result.score == PARTIAL_CEILING
+    ceiling = [c for c in result.contributions if "evidence incomplete" in c.label]
+    assert len(ceiling) == 1
+    assert ceiling[0].points == PARTIAL_CEILING - 91     # 91 was the real score
+
+
+def test_the_rows_are_in_display_order_worst_findings_first():
+    """The reader scans top-down and should meet the biggest subtraction
+    first. Dict iteration order is not a layout decision."""
+    result = score(ev(vuln("low", id="l"), vuln("critical", id="c"),
+                      vuln("moderate", id="m"), vuln("high", id="h")))
+    labels = [c.label for c in result.contributions]
+    order = [next(i for i, l in enumerate(labels) if sev in l)
+             for sev in ("critical", "high", "moderate", "low")]
+    assert order == sorted(order)
+    assert labels[0] == "starting point"
+
+
+def test_contributions_are_frozen():
+    """They are a record of a calculation already performed. Editing one after
+    the fact would make the score and its explanation disagree."""
+    from pydantic import ValidationError
+    row = score(ev()).contributions[0]
+    with pytest.raises(ValidationError):
+        row.points = 999
+
+
+def test_the_breakdown_does_not_change_any_score():
+    """The whole §1.5 golden table was computed before contributions existed.
+    Adding an explanation must not alter what is being explained."""
+    assert score(ev()).score == 60
+    assert score(ev(vuln("high"))).score == 60 - 12 + FIX_CREDIT
+    assert score(ev(registry=HEALTHY_REGISTRY, repository=HEALTHY_REPO)).score == 91
