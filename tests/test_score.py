@@ -189,7 +189,7 @@ def test_the_same_evidence_scores_identically_twice():
 
 
 def test_the_assessment_is_stamped_with_the_new_version():
-    assert score(ev()).scoring_version == SCORING_VERSION == "0.2.1"
+    assert score(ev()).scoring_version == SCORING_VERSION == "0.3.0"
 
 
 # ------------------------------------------------------------------------------

@@ -28,7 +28,11 @@ from .models import Assessment, Contribution, Evidence, RiskLevel, Severity
 # 0.2.0 -> 0.2.1: per-weight Contribution rows. No weight changed, but a stored
 #                 score is now explicable at the row level, so the version
 #                 moves to say which shape a stored Assessment has.
-SCORING_VERSION = "0.2.1"
+# 0.2.1 -> 0.3.0: maintainer and host DECLARATIONS -- npm `deprecated` (-25)
+#                 and GitHub `disabled` (-25). New weights, so a minor bump:
+#                 a score stored under 0.2.x cannot be reproduced under this
+#                 table, which is exactly what §10.3 stores the version for.
+SCORING_VERSION = "0.3.0"
 
 # §9.4. Starting below the midpoint is the first of two structural fixes for
 # the saturation recorded in NOTES-0_5 §2: a package about which nothing is
@@ -63,7 +67,13 @@ _PUBLISH_AGE = ((730, -15), (365, -8))
 _PUBLISH_FRESH = (90, 8)
 _DOWNLOADS = ((1_000_000, 10), (100_000, 5))
 _DOWNLOADS_FLOOR = (1_000, -10)
-_ARCHIVED = -20
+# DECLARATIONS -- things a human deliberately said about this package, as
+# opposed to signals inferred from activity. They are weighted heavier than any
+# inference, because an inference can be wrong about intent and a statement
+# cannot: "stop using this" is not a guess about staleness.
+_DEPRECATED = -25        # the package's own maintainer
+_DISABLED = -25          # GitHub, for DMCA / terms-of-service / abuse
+_ARCHIVED = -20          # the maintainer, saying the repository is finished
 _CONTRIBUTORS = (20, 8)
 _SOLE_MAINTAINER = -8
 _MANY_MAINTAINERS = (3, 5)
@@ -141,10 +151,33 @@ def _fix_credit_row(evidence: Evidence) -> Contribution | None:
                         points=FIX_CREDIT)
 
 
-def _maintenance_rows(evidence: Evidence) -> list[Contribution]:
+def _declaration_rows(evidence: Evidence) -> list[Contribution]:
+    """Statements, not inferences. Shown first after the findings.
+
+    A deprecation notice is the only signal in the whole table that is a direct
+    human statement of intent. Every other row is the tool inferring something
+    from activity -- downloads, dates, counts -- and an inference can be wrong
+    about intent in a way a statement cannot.
+
+    The label carries the maintainer's MESSAGE, not just the fact, because the
+    message usually says what to do instead ("use String.prototype.padStart()")
+    and no weight can convey that.
+    """
     rows: list[Contribution] = []
-    repository = evidence.repository
     registry = evidence.registry
+    repository = evidence.repository
+
+    if registry is not None and registry.deprecated:
+        # The LABEL explains the number; the MESSAGE is rendered separately.
+        # Interpolating the message here would push a 200-character string into
+        # a 44-character table column and truncate the one part of it that is
+        # actionable -- usually the "use X instead" at the end.
+        rows.append(Contribution(label="deprecated by its maintainer",
+                                 points=_DEPRECATED))
+
+    if repository is not None and repository.disabled is True:
+        rows.append(Contribution(
+            label="repository disabled by GitHub", points=_DISABLED))
 
     # `is True` is for the reader, not for safety: archived is bool|None by the
     # time it arrives (Pydantic coerces, and github.parse() maps any non-bool
@@ -158,7 +191,12 @@ def _maintenance_rows(evidence: Evidence) -> list[Contribution]:
     if repository is not None and repository.archived is True:
         rows.append(Contribution(label="repository is archived",
                                  points=_ARCHIVED))
+    return rows
 
+
+def _maintenance_rows(evidence: Evidence) -> list[Contribution]:
+    rows: list[Contribution] = []
+    registry = evidence.registry
     days = registry.days_since_last_publish if registry else None
     if days is not None:
         for threshold, weight in _PUBLISH_AGE:
@@ -287,6 +325,9 @@ def score(evidence: Evidence) -> Assessment:
     if credit is not None:
         rows.append(credit)
 
+    # Declarations before inferences: a reader scanning top-down should meet
+    # "the maintainer told you to stop" before "it has a lot of downloads".
+    rows.extend(_declaration_rows(evidence))
     rows.extend(_maintenance_rows(evidence))
     rows.extend(_community_rows(evidence))
 

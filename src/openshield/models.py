@@ -146,12 +146,29 @@ class RegistryInfo(BaseModel):
     days_since_last_publish: int | None = None     # §9.2: an integer, not a date
     repository_owner: str | None = None
     repository_name: str | None = None
+    # The monorepo subpath, when the package declares one
+    # ("packages/babel-core"). Parsed but UNWEIGHTED -- its presence means the
+    # repository-level community signals belong to the parent project rather
+    # than to this package (NOTES-1_3 §3). Recorded so the decision can be
+    # revisited without re-reading every packument.
+    repository_directory: str | None = None
+    # THE MAINTAINER'S OWN MESSAGE, verbatim, or None.
+    #
+    # A STRING rather than a bool, because the message IS the signal: "use
+    # String.prototype.padStart()" tells you what to do instead, which no
+    # boolean can. Sanitised at parse (npm.py) because it is free text from the
+    # registry that we print to a terminal.
+    deprecated: str | None = None
 
 
 class RepositoryInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     archived: bool | None = None
+    # GitHub disabled the repository -- DMCA, terms-of-service, or abuse. Not
+    # the maintainer's statement but the host's, and rarer and stronger than
+    # archiving: somebody complained and GitHub agreed.
+    disabled: bool | None = None
     days_since_last_push: int | None = None
     contributors: int | None = None
     stars: int | None = None

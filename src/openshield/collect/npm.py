@@ -29,6 +29,10 @@ from .base import CollectorResult, _as_list, _dig
 
 DOWNLOADS_HOST = "https://api.npmjs.org/downloads/point/last-week"
 
+# Long enough for any real deprecation notice (`request`'s is 78 characters),
+# short enough that one field cannot flood the screen.
+_MAX_MESSAGE = 200
+
 
 # ------------------------------- transport ------------------------------------
 
@@ -144,6 +148,17 @@ def parse(payload: dict, ref: PackageRef) -> RegistryInfo | None:
         _dig(this_version, "repository") or _dig(packument, "repository")
     )
 
+    # Per-version first, then the whole package. A package can deprecate one
+    # release without deprecating itself -- and the version you are installing
+    # is the one that matters (§7).
+    deprecated = _clean_message(_dig(this_version, "deprecated"))
+    if deprecated is None:
+        deprecated = _clean_message(_dig(packument, "deprecated"))
+
+    directory = _dig(this_version, "repository", "directory")
+    if not isinstance(directory, str) or not directory:
+        directory = _dig(packument, "repository", "directory")
+
     return RegistryInfo(
         maintainer_count=_count(_dig(packument, "maintainers")),
         license=_license(this_version, packument),
@@ -151,6 +166,8 @@ def parse(payload: dict, ref: PackageRef) -> RegistryInfo | None:
         days_since_last_publish=_days_since_publish(packument, ref),
         repository_owner=owner_repo[0] if owner_repo else None,
         repository_name=owner_repo[1] if owner_repo else None,
+        repository_directory=directory if isinstance(directory, str) and directory else None,
+        deprecated=deprecated,
     )
 
 
@@ -218,6 +235,52 @@ def _parse_iso(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def _clean_message(value: object) -> str | None:
+    """A maintainer-authored message, made safe to print. None if absent.
+
+    THIS IS UNTRUSTED TEXT WE PUT ON A TERMINAL. The registry serves whatever
+    the publisher typed, and a publisher is exactly the party this tool treats
+    as potentially hostile (§7). Three things get stripped:
+
+      ANSI escapes and control characters -- `\x1b[2J` clears the screen,
+      `\r` overwrites the line just printed. A deprecation notice that could
+      erase the findings above it would turn the renderer into the attack.
+      §11.3 bans ANSI in our own output; text we PASS THROUGH is the same ban.
+
+      Newlines -- collapsed to spaces, so one field cannot forge extra lines of
+      output that look like the tool's own.
+
+      Length -- capped. A megabyte of text in one field is a denial of service
+      against the reader.
+
+    npm also publishes `deprecated: true` with no message, which becomes a
+    generic string: the fact is the signal, and None would lose it.
+    """
+    if value is True:
+        return "deprecated by its maintainer (no message given)"
+    if not isinstance(value, str):
+        return None
+    # Every disallowed character becomes a SPACE, not nothing. Deleting them
+    # would join the words either side -- "foo\x00bar" -> "foobar" -- which
+    # misrepresents what the publisher wrote. Substituting keeps the seam
+    # visible, and the collapse below tidies the result.
+    #
+    # `isprintable()` is already False for \n, \r, \t and every other control
+    # character, so no separate whitespace clause is needed; `isascii()` then
+    # removes the non-ASCII lookalikes that could dress text up as our own
+    # output (U+00A0, the box-drawing range, right-to-left overrides).
+    safe = "".join(
+        character if character.isprintable() and character.isascii() else " "
+        for character in value
+    )
+    cleaned = " ".join(safe.split())     # collapses runs, strips the ends
+    if not cleaned:
+        return None
+    if len(cleaned) > _MAX_MESSAGE:
+        return cleaned[:_MAX_MESSAGE] + "..."
+    return cleaned
 
 
 # --------------------------- repository shorthand ------------------------------
