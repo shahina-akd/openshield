@@ -1,13 +1,7 @@
-"""collect/github.py -- wave 2.
+"""Tests for collect/github.py.
 
-Four sections: the gate (which branch fires when), status handling (404 vs 403
-vs rate limit), the contributor count (the Link-header trick and its fallback),
-and parsing.
-
-FIXTURES USE GITHUB'S TIMESTAMP FORMAT (`...T12:00:00Z`, no milliseconds), not
-datetime.isoformat(). The registry sends milliseconds, GitHub does not, and
-both end in Z -- a fixture built from isoformat() produces `+00:00`, which
-neither host ever sends (NOTES-M1 D.4).
+Fixtures use GitHub's timestamp format (`...T12:00:00Z`, no milliseconds),
+not datetime.isoformat(), which produces `+00:00`.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -35,7 +29,6 @@ SOURCE = SourceRef(name="github",
 
 
 def github_time(days_ago: int) -> str:
-    """GitHub's own shape: no milliseconds, trailing Z."""
     moment = datetime.now(timezone.utc) - timedelta(days=days_ago)
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -75,22 +68,18 @@ def no_token(monkeypatch):
 
 
 # ------------------------------------------------------------------------------
-# 1. The gate -- which branch fires, and whether it is degradation
+# 1. Skip versus failure
 # ------------------------------------------------------------------------------
 
 def test_no_token_is_a_skip_not_a_failure(no_token):
-    """A.3. This fires on EVERY run for an unconfigured user. A warning that
-    always fires is furniture, and it would train the reader past the OSV
-    failures that matter."""
+    """Unconfigured users would otherwise see a warning on every run."""
     result = _call()
     assert result.ok is False
-    assert result.skipped is True            # -> never sets partial
+    assert result.skipped is True
     assert "no token" in result.error
 
 
 def test_the_token_is_never_echoed_in_an_error(token):
-    """§13: secrets are environment-only and never rendered. Cheap, and the
-    kind of test usually added only after a leak."""
     with respx.mock:
         respx.get(url__regex=r".*api\.github\.com/.*").respond(403)
         result = _call()
@@ -98,23 +87,20 @@ def test_the_token_is_never_echoed_in_an_error(token):
 
 
 def test_a_package_with_no_repository_is_a_skip(token):
-    """B.5. Nothing to fetch is a complete answer -- including GitLab,
-    Bitbucket and monorepo subpaths, which npm.py refuses to guess at."""
     result = _call(registry=NO_REPO)
     assert result.ok is False and result.skipped is True
     assert "no GitHub repository" in result.error
 
 
 def test_a_failed_registry_lookup_is_degradation_naming_the_lookup(token):
-    """A.1: an unknown repository is different from knowing there is none."""
+    """An unknown repository is not the same as having none."""
     result = _call(registry=None, registry_ok=False)
     assert result.ok is False and result.skipped is False
     assert "repository unknown (registry lookup failed)" in result.error
 
 
 def test_an_unreadable_packument_says_so_rather_than_blaming_the_lookup(token):
-    """D.3. The registry ANSWERED. Saying the lookup failed would put a false
-    claim in degraded_sources."""
+    """The registry did respond, so the error must not claim the lookup failed."""
     result = _call(registry=None, registry_ok=True)
     assert result.ok is False and result.skipped is False
     assert "could not be read" in result.error
@@ -122,21 +108,17 @@ def test_an_unreadable_packument_says_so_rather_than_blaming_the_lookup(token):
 
 
 def test_the_gate_makes_no_request_when_it_skips(no_token):
-    """The skip branches must short-circuit BEFORE the network. conftest's
-    socket guard raises a BaseException on any real connection, so a leak here
-    errors rather than degrading."""
-    assert _call().skipped is True          # no respx mock, no guard trip
+    """No respx mock is active, so any request would trip the network guard."""
+    assert _call().skipped is True
 
 
 # ------------------------------------------------------------------------------
-# 2. Status handling -- 404 vs 403 vs rate limit
+# 2. Status handling
 # ------------------------------------------------------------------------------
 
 @respx.mock
 def test_a_404_is_a_failure_not_an_absence(token):
-    """Moved, renamed, private or deleted -- we do not know which, and we know
-    nothing about the repository. The OPPOSITE of a 404 from the npm downloads
-    host, which is a real answer of zero (B.5)."""
+    """The repository may be moved, private or deleted; we cannot tell which."""
     respx.get(REPO_URL).respond(404)
     respx.get(url__startswith=CONTRIB_URL).respond(404)
     result = _call()
@@ -146,7 +128,6 @@ def test_a_404_is_a_failure_not_an_absence(token):
 
 @respx.mock
 def test_a_rate_limit_says_when_it_resets(token):
-    """A message you can act on beats one you can only read."""
     reset = int(datetime(2026, 10, 9, 18, 42, tzinfo=timezone.utc).timestamp())
     respx.get(url__regex=r".*api\.github\.com/.*").respond(
         403, headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset)})
@@ -157,8 +138,6 @@ def test_a_rate_limit_says_when_it_resets(token):
 
 @respx.mock
 def test_a_403_that_is_not_a_rate_limit_reads_differently(token):
-    """A token without the right scope, or a repository you cannot see. Same
-    status code, a different thing to go and fix."""
     respx.get(url__regex=r".*api\.github\.com/.*").respond(
         403, headers={"X-RateLimit-Remaining": "4998"})
     result = _call()
@@ -191,7 +170,7 @@ def test_transport_errors_are_return_values(token, exc, fragment):
 
 
 # ------------------------------------------------------------------------------
-# 3. The contributor count -- the Link-header trick
+# 3. Contributor count
 # ------------------------------------------------------------------------------
 
 def _response(body, headers=None) -> httpx.Response:
@@ -199,47 +178,36 @@ def _response(body, headers=None) -> httpx.Response:
 
 
 def test_the_count_comes_from_the_link_headers_last_page():
-    """per_page=1 makes the last page number the contributor count. GitHub
-    exposes it no other way."""
+    """With per_page=1, the last page number equals the contributor count."""
     assert contributor_count(_response([{}], {"Link": link_header(431)})) == 431
 
 
 def test_no_link_header_means_one_page_so_the_fallback_is_the_body_length():
-    """NEVER 0 by default. Zero would read as 'no contributors' and cost -8
-    under §9.4, for a repository that simply has one."""
     assert contributor_count(_response([{"login": "a"}])) == 1
 
 
 def test_an_empty_list_with_no_link_header_is_a_real_zero():
-    """GitHub returns [] for a repository with no commits. That IS zero
-    contributors -- a measurement, not an absence."""
+    """GitHub returns [] for a repository with no commits."""
     assert contributor_count(_response([])) == 0
 
 
 @pytest.mark.parametrize("body", [{"message": "Not Found"}, "a string", 7, None])
 def test_a_body_that_is_not_a_list_is_unknown_not_zero(body):
-    """None means 'we genuinely do not know', which §9.4 scores as no signal
-    rather than as a bad one."""
     assert contributor_count(_response(body)) is None
 
 
 def test_a_malformed_link_header_falls_back_to_the_body():
-    """Over-trusting the header is how you get 0 or a crash. The body is still
-    there to count."""
     assert contributor_count(_response([{}], {"Link": "garbage"})) == 1
 
 
 def test_the_header_is_matched_case_insensitively():
-    """httpx normalises header names, but a cached or proxied response may not
-    arrive through httpx in M1 Step 1.4."""
+    """Cached or proxied responses may not have httpx-normalised header names."""
     assert contributor_count(_response([{}], {"link": link_header(9)})) == 9
 
 
 @respx.mock
 def test_a_failed_contributor_lookup_is_an_incomplete_answer(token):
-    """ok=True WITH an error -- the same relationship the downloads host has
-    to the packument in npm.py. The repository answered; one field is missing.
-    """
+    """ok=True with an error: the repository answered, one field is missing."""
     respx.get(REPO_URL).respond(200, json=repo_body())
     respx.get(url__startswith=CONTRIB_URL).respond(500)
 
@@ -252,8 +220,6 @@ def test_a_failed_contributor_lookup_is_an_incomplete_answer(token):
 
 @respx.mock
 def test_a_failed_repository_lookup_fails_the_collector(token):
-    """The repository is this collector's reason to exist. Without it there is
-    nothing to have an incomplete version of."""
     respx.get(REPO_URL).respond(404)
     respx.get(url__startswith=CONTRIB_URL).respond(200, json=[{}],
                                                    headers={"Link": link_header(400)})
@@ -261,7 +227,7 @@ def test_a_failed_repository_lookup_fails_the_collector(token):
 
 
 # ------------------------------------------------------------------------------
-# 4. Transport, merged, and parsing
+# 4. Transport and parsing
 # ------------------------------------------------------------------------------
 
 @respx.mock
@@ -291,8 +257,6 @@ def test_the_token_is_sent_as_a_bearer_header(token):
 
 @respx.mock
 def test_an_archived_repository_reports_archived_true(token):
-    """The signal §9.4 charges -20 for, and the reason archived=None must be
-    distinguishable from archived=False (A.2)."""
     respx.get(REPO_URL).respond(200, json=repo_body(archived=True))
     respx.get(url__startswith=CONTRIB_URL).respond(200, json=[{}])
     assert parse(_call().data, SOURCE).archived is True
@@ -302,8 +266,7 @@ def test_an_archived_repository_reports_archived_true(token):
     {}, {"full_name": "x"}, {"full_name": "x", "stargazers_count": 1}, [], "str", None, 7,
 ])
 def test_parse_returns_None_for_an_unreadable_body(bad):
-    """Same None-versus-default rule as npm.parse. A defaulted
-    RepositoryInfo() would be a measurement that never happened."""
+    """A default RepositoryInfo() would report measurements never taken."""
     assert parse(bad, SOURCE) is None
 
 
@@ -314,7 +277,6 @@ def test_parse_returns_None_for_an_unreadable_body(bad):
     {"archived": False, "_contributor_count": "many"},
 ])
 def test_parse_never_raises_and_wrong_shapes_become_None(body):
-    """B.4, extended to this collector."""
     info = parse(body, SOURCE)
     assert info is None or isinstance(info, RepositoryInfo)
 
@@ -323,13 +285,11 @@ def test_a_wrong_shaped_field_is_None_not_a_default():
     info = parse({"archived": "yes", "stargazers_count": "lots",
                   "pushed_at": "nonsense"}, SOURCE)
     assert info is not None
-    assert info.archived is None          # "yes" is not a bool
+    assert info.archived is None
     assert info.stars is None
     assert info.days_since_last_push is None
 
 
 def test_the_age_uses_githubs_timestamp_format():
-    """No milliseconds, trailing Z -- and _parse_iso is imported from npm.py
-    rather than reimplemented, so there is one place for this trap to live."""
     info = parse({"archived": False, "pushed_at": github_time(45)}, SOURCE)
     assert info.days_since_last_push == 45

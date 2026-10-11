@@ -1,12 +1,11 @@
-"""collect/npm.py -- the registry collector.
+"""Tests for collect/npm.py.
 
-Split the way the module is: transport tests drive fetch() through a small
-sync wrapper, parsing tests call parse() directly with literal dicts.
+Transport tests drive fetch() through a sync wrapper; parsing tests call
+parse() directly with literal dicts.
 
-FIXTURES USE THE HOST'S OWN TIMESTAMP FORMAT (`...T12:00:00.000Z`), not
-datetime.isoformat() (`...+00:00`). A fixture in a format the registry never
-sends lets the parser be wrong about every real timestamp and still pass
-(NOTES-M1 D.4).
+Fixtures use the registry's timestamp format (`...T12:00:00.000Z`), not
+datetime.isoformat() (`...+00:00`), so the parser is tested against what the
+registry actually sends.
 """
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -33,7 +32,6 @@ DOWNLOADS = "https://api.npmjs.org/downloads/point/last-week/axios"
 
 
 def registry_time(days_ago: int) -> str:
-    """The registry's own shape: milliseconds and a Z suffix."""
     moment = datetime.now(timezone.utc) - timedelta(days=days_ago)
     return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -66,7 +64,7 @@ def _fetch(ref: PackageRef = REF):
 
 
 # ------------------------------------------------------------------------------
-# 1. parse -- the D.3 boundary
+# 1. parse
 # ------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("bad", [
@@ -81,19 +79,14 @@ def _fetch(ref: PackageRef = REF):
     None,
 ])
 def test_parse_returns_None_for_an_unreadable_packument(bad):
-    """D.3. A defaulted RegistryInfo() here would have repository_owner=None,
-    which fetch_for reads as 'declares no repository' -- a SKIP. An unreadable
-    response would then be reported as a KNOWN ABSENCE."""
+    """A default RegistryInfo() would read as "no repository declared",
+    turning an unreadable response into a known absence."""
     assert parse(bad, REF) is None
 
 
 def test_parse_returns_a_model_when_the_packument_declares_no_repository():
-    """The OTHER side of the line. A readable packument that genuinely has no
-    repository IS a known absence, and must parse to a model with no owner.
-
-    This pair is the point: one asserts None, the other asserts not-None, and
-    together they pin the boundary between 'could not read' and 'read, and
-    absent'."""
+    """Counterpart to the test above: a readable packument without a
+    repository is a known absence."""
     pack = packument()
     del pack["repository"]
     pack["versions"] = {"1.7.2": {"license": "MIT"}}
@@ -126,16 +119,12 @@ def test_parse_extracts_every_field():
     {"packument": {"versions": {}}, "downloads": {"downloads": "many"}},
 ])
 def test_parse_never_raises(junk):
-    """B.4. The registry response is deeper and more variable than an OSV
-    record, so the same wrong-shape class has more places to hide."""
     result = parse(junk, REF)
     assert result is None or isinstance(result, RegistryInfo)
 
 
 def test_missing_fields_are_None_not_zero():
-    """A.2's rule at the parse site. 0 maintainers is a MEASUREMENT (and an
-    alarming one); a missing field is an absence. §9.4 must never treat them
-    alike."""
+    """Zero is a measurement; a missing field is an absence."""
     info = parse({"packument": {"versions": {}}}, REF)
     assert info is not None
     assert info.maintainer_count is None
@@ -145,25 +134,21 @@ def test_missing_fields_are_None_not_zero():
 
 
 def test_a_version_level_license_beats_the_top_level_one():
-    """A package can relicense between releases. The version-level field is
-    the one that applies to what you are about to install."""
+    """A package can relicense between releases."""
     pack = packument(license="Apache-2.0")
     pack["versions"] = {"1.7.2": {"license": "MIT"}}
     assert parse(payload(pack), REF).license == "MIT"
 
 
 def test_the_legacy_license_object_is_read():
-    """npm's old form: {"type": "MIT", "url": "..."}. Still in published
-    packuments, so refusing it would report 'no license' for a licensed
-    package -- and §9.4 charges -5 for that."""
+    """The legacy {"type": ..., "url": ...} form still appears in published
+    packuments."""
     pack = packument()
     pack["versions"] = {"1.7.2": {"license": {"type": "MIT", "url": "http://x"}}}
     assert parse(payload(pack), REF).license == "MIT"
 
 
 def test_the_age_is_for_the_resolved_version_not_the_latest():
-    """§7's whole point. `time` carries a timestamp per version; reading the
-    wrong one would describe a package other than the one being installed."""
     pack = packument()
     pack["versions"] = {"1.0.0": {}, "1.7.2": {}}
     pack["time"] = {"1.0.0": registry_time(900), "1.7.2": registry_time(10)}
@@ -171,20 +156,20 @@ def test_the_age_is_for_the_resolved_version_not_the_latest():
 
 
 # ------------------------------------------------------------------------------
-# 2. _parse_iso -- the formats the hosts actually send
+# 2. _parse_iso
 # ------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("raw", [
-    "2024-05-01T12:00:00.000Z",      # the registry, as sent
-    "2024-05-01T12:00:00Z",          # GitHub, as sent
-    "2024-05-01T12:00:00+00:00",     # the form Python itself produces
+    "2024-05-01T12:00:00.000Z",      # npm registry
+    "2024-05-01T12:00:00Z",          # GitHub
+    "2024-05-01T12:00:00+00:00",     # Python isoformat()
 ])
 def test_parse_iso_accepts_what_the_hosts_actually_send(raw):
     assert _parse_iso(raw) == datetime(2024, 5, 1, 12, tzinfo=timezone.utc)
 
 
 @pytest.mark.parametrize("raw", [
-    "2024-05-01T12:00:00",           # naive -- a guess about the timezone
+    "2024-05-01T12:00:00",           # naive
     "yesterday", "", None, 7, {}, ["2024-05-01"],
 ])
 def test_parse_iso_refuses_junk_and_naive_times(raw):
@@ -192,7 +177,7 @@ def test_parse_iso_refuses_junk_and_naive_times(raw):
 
 
 # ------------------------------------------------------------------------------
-# 3. parse_github_repo -- one test per shape npm actually publishes
+# 3. parse_github_repo
 # ------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("url,expected", [
@@ -219,15 +204,12 @@ def test_parse_github_repo_accepts_every_published_shape(url, expected):
     "bitbucket:owner/repo",
     "https://example.com/owner/repo",
     "https://github.com/axios",                       # no repo segment
-    "https://github.com/axios/axios/tree/main/pkg",   # a monorepo SUBPATH
+    "https://github.com/axios/axios/tree/main/pkg",   # monorepo subpath
     "", "   ", "not a url", None, 7, [], {}, {"url": None}, {"url": 7},
 ])
 def test_parse_github_repo_returns_None_rather_than_guessing(url):
-    """A wrong owner/repo pair means showing GitHub evidence about somebody
-    else's project under this package's name. Worse than showing none.
-
-    GitLab and Bitbucket are real repositories this collector cannot read --
-    a SKIP in fetch_for, not a failure."""
+    """A wrong owner/repo would attribute another project's GitHub data to
+    this package."""
     assert parse_github_repo(url) is None
 
 
@@ -251,8 +233,8 @@ def test_both_hosts_are_queried_and_merged():
 
 @respx.mock
 def test_fetch_returns_raw_payloads_not_parsed_models():
-    """Step 1.4 caches exactly what fetch returns, so it must be raw (B.2).
-    It is also what keeps the age integer correct across a cache hit."""
+    """The cache stores fetch() output, so derived values such as age must be
+    computed later, in parse()."""
     respx.get(REGISTRY_URL).respond(200, json=packument())
     respx.get(DOWNLOADS).respond(200, json={"downloads": 1})
     assert isinstance(_fetch().data["packument"], dict)
@@ -266,8 +248,6 @@ def test_fetch_returns_raw_payloads_not_parsed_models():
     (httpx.Response(200, json=[]), "not a JSON object"),
 ])
 def test_a_failed_packument_fails_the_collector(response, fragment):
-    """The packument is this collector's reason to exist. Without it there is
-    no registry evidence at all, so its failure is the collector's failure."""
     respx.get(REGISTRY_URL).mock(return_value=response)
     respx.get(DOWNLOADS).respond(200, json={"downloads": 1})
 
@@ -279,15 +259,11 @@ def test_a_failed_packument_fails_the_collector(response, fragment):
 
 @respx.mock
 @pytest.mark.parametrize("response", [
-    httpx.Response(404),        # genuinely no download stats
-    httpx.Response(503),        # the host is down
+    httpx.Response(404),
+    httpx.Response(503),
 ])
 def test_a_failed_downloads_lookup_is_an_incomplete_answer_not_a_failure(response):
-    """ok=True WITH an error -- the state CollectorResult documents as 'I got
-    an answer and it was incomplete'.
-
-    _assemble lists npm-registry among the sources that answered AND names the
-    gap in degraded_sources. Both are true at once, which is the point."""
+    """ok=True with an error: the source answered, but incompletely."""
     respx.get(REGISTRY_URL).respond(200, json=packument())
     respx.get(DOWNLOADS).mock(return_value=response)
 
@@ -314,9 +290,8 @@ def test_transport_errors_are_return_values(exc, fragment):
 
 @respx.mock
 def test_scoped_names_are_encoded_for_the_registry_but_not_the_downloads_host():
-    """Two hosts, two rules for the same string. The registry needs %2F in the
-    path; the downloads API takes the scope literally. If scoped packages ever
-    lose their download counts, this is the first place to look."""
+    """The registry requires %2F in the path; the downloads API takes the
+    scope literally."""
     reg = respx.get("https://registry.npmjs.org/@babel%2Fcore").respond(
         200, json={"name": "@babel/core", "versions": {"7.24.0": {}}, "time": {}})
     dl = respx.get(
@@ -336,13 +311,9 @@ def test_downloads_url_keeps_the_scope_literal():
 
 @respx.mock
 def test_the_two_requests_overlap(monkeypatch):
-    """Two independent hosts, so they run concurrently -- the same reasoning
-    as wave 1, one level down.
-
-    Each response waits for the other to have been requested. Sequential
-    awaits deadlock, the wait times out, and the TIMEOUT IS CAUGHT and turned
-    into a failure -- so the assertion is on the RESULT, not on completing
-    without raising."""
+    """Each response waits for the other request to arrive, so sequential
+    requests time out. The timeout is caught by the collector, hence the
+    assertion on the result."""
     arrived: dict[str, asyncio.Event] = {}
 
     def gate(me: str, other: str, body: dict):

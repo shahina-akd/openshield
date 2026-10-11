@@ -1,4 +1,4 @@
-"""execute.py -- the only module that runs npm."""
+"""Tests for execute.py."""
 import os
 
 from openshield import execute
@@ -17,13 +17,13 @@ def test_run_npm_never_uses_a_shell(monkeypatch, tmp_path):
 
     execute.run_npm(["install", "axios"])
 
-    assert seen["cmd"] == ["/usr/bin/npm", "install", "axios"]   # a list
+    assert seen["cmd"] == ["/usr/bin/npm", "install", "axios"]
     assert seen["kwargs"].get("shell") is not True
 
 
 def test_real_npm_keeps_node_manager_shims(tmp_path, monkeypatch):
-    """Only OUR directory is removed. An nvm shim must still win, or npm runs
-    under the wrong Node."""
+    """Only our shim directory is skipped; other managers' shims must win so
+    npm runs under the intended Node version."""
     nvm = tmp_path / ".nvm" / "versions" / "node" / "v22" / "bin"
     nvm.mkdir(parents=True)
     (nvm / "npm").write_text("#!/bin/sh\nexit 0\n")

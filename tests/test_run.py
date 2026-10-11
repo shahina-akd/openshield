@@ -35,9 +35,6 @@ def mocked_registry_and_osv(respx_mock):
 
 
 def test_reject_never_calls_execute(never_npm, monkeypatch, mocked_registry_and_osv):
-    """§15: 'Reject -> execute() never called.' The core promise of the whole
-    tool, asserted mechanically rather than trusted. If this ever fails,
-    nothing else in the project matters."""
     monkeypatch.setattr("openshield.run.is_interactive", lambda: True)
     monkeypatch.setattr("openshield.run.prompt", lambda *a, **k: "reject")
     assert run_intercept(["npm", "install", "axios"]) == REJECTED
@@ -45,11 +42,6 @@ def test_reject_never_calls_execute(never_npm, monkeypatch, mocked_registry_and_
 
 def test_no_tty_exits_12_without_ever_calling_input(never_npm, monkeypatch,
                                                     mocked_registry_and_osv):
-    """§15: 'Non-TTY stdin -> exit 12, no hang.'
-
-    The assertion that matters is not the exit code -- it is that input() is
-    never REACHED. A hang cannot be tested directly; the reachability of the
-    blocking call can."""
     def explode(*a, **k):
         raise AssertionError("input() called with no TTY -- this would hang")
     monkeypatch.setattr("builtins.input", explode)
@@ -64,14 +56,6 @@ def test_ci_env_counts_as_no_tty(monkeypatch):
 
 
 def test_all_sources_failed_refuses(never_npm, monkeypatch, respx_mock):
-    """§15: 'All sources failed -> exit 12, not "no vulnerabilities".' Here the
-    consequence is behavioural rather than cosmetic: fail-closed.
-
-    EVERY evidence host must fail, not just OSV. This test was written in Step
-    0.7 when npm and GitHub were skeletons that skipped; Step 1.2 made the
-    registry a real source, so mocking OSV alone leaves npm answering and the
-    branch correctly does not fire. Step 1.3 adds api.github.com to this list.
-    """
     respx_mock.get(url__regex=r".*registry\.npmjs\.org/.*").respond(503)
     respx_mock.get(url__regex=r".*api\.npmjs\.org/.*").respond(503)
     respx_mock.post("https://api.osv.dev/v1/query").respond(503)
@@ -79,16 +63,12 @@ def test_all_sources_failed_refuses(never_npm, monkeypatch, respx_mock):
     assert run_intercept(["npm", "install", "axios"]) == POLICY_BLOCKED
 
 def test_an_all_unresolvable_command_still_reaches_the_prompt(monkeypatch, npm_spy):
-    """unresolvable_policy defaults to 'prompt' (§11.1). The empty-refs guard
-    in run.py is what keeps this from reporting a source failure that never
-    happened."""
     monkeypatch.setattr("openshield.run.is_interactive", lambda: True)
     monkeypatch.setattr("openshield.run.prompt", lambda *a, **k: "approve")
     assert run_intercept(["npm", "install", "./local"]) == 0
     assert npm_spy == [["install", "./local"]]
 
 def test_approve_runs_the_original_argv(monkeypatch, npm_spy, mocked_registry_and_osv):
-    """Verbatim, not reconstructed. The user approved what they read."""
     monkeypatch.setattr("openshield.run.is_interactive", lambda: True)
     monkeypatch.setattr("openshield.run.prompt", lambda *a, **k: "approve")
     run_intercept(["npm", "install", "-D", "axios", "--save-exact"])
@@ -96,8 +76,6 @@ def test_approve_runs_the_original_argv(monkeypatch, npm_spy, mocked_registry_an
 
 
 def test_npms_exit_code_is_propagated(monkeypatch, mocked_registry_and_osv):
-    """§11.2: so && chains and scripts behave identically with the tool in the
-    loop as without it."""
     monkeypatch.setattr(openshield.run, "run_npm", lambda argv: 7)
     monkeypatch.setattr("openshield.run.is_interactive", lambda: True)
     monkeypatch.setattr("openshield.run.prompt", lambda *a, **k: "approve")
@@ -112,9 +90,6 @@ def test_npms_exit_code_is_propagated(monkeypatch, mocked_registry_and_osv):
     (["npm", "install"], ["install"]),
 ])
 def test_pass_through_forwards_without_analysis(argv, forwarded, npm_spy):
-    """conftest's network guard fails this loudly if the analysis path is
-    reached -- which is the real assertion. `npm run dev` must not pay for a
-    registry round trip."""
     assert run_intercept(argv) == 0
     assert npm_spy == [forwarded]
 
@@ -131,8 +106,6 @@ def test_an_internal_error_never_installs(monkeypatch, never_npm):
     assert run_intercept(["npm", "install", "axios"]) == 20
 
 
-# Updated after M1.1: collect/ gained base, npm and github. A module missing
-# from this list is a module nobody is checking, so add new ones as they land.
 ANALYSIS_MODULES = ["parse", "resolve", "score", "render", "decide",
                     "collect", "collect.base", "collect.osv",
                     "collect.npm", "collect.github", "collect.cvss"]
@@ -140,11 +113,6 @@ ANALYSIS_MODULES = ["parse", "resolve", "score", "render", "decide",
 
 @pytest.mark.parametrize("name", ANALYSIS_MODULES)
 def test_no_analysis_module_can_run_a_subprocess(name):
-    """§4: 'Nothing on the analysis path may execute an install.' Structural,
-    not conventional -- reachability is the guarantee, not care.
-
-    run.py and execute.py are the only permitted importers, and run.py reaches
-    run_npm only after an approval."""
     module = importlib.import_module(f"openshield.{name}")
     tree = ast.parse(inspect.getsource(module))
     imported = set()

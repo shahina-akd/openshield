@@ -1,16 +1,4 @@
-"""collect/osv.py -- extraction (pure) and transport (async, via a sync wrapper).
-
-M1 Step 1.1 changed only the transport half: query()/collect_osv() became
-`async def fetch(ref, client) -> CollectorResult`. Everything in sections 1-3
-is unchanged from M0 apart from imports -- that is the payoff of the
-transport/parse split (NOTES-M1 B.1).
-
-The M0 tests of _evidence() and SourceResult moved to test_collect.py, where
-assembly now lives. The _as_list/_dig tests moved to test_base.py.
-
-No test here is async. Transport tests drive fetch() through _fetch(), a small
-sync wrapper around asyncio.run -- the same boundary collect() uses.
-"""
+"""collect/osv.py -- extraction (pure) and transport (async, via a sync wrapper)."""
 import asyncio
 import json
 from datetime import datetime, timezone
@@ -121,8 +109,6 @@ def test_tier_three_continues_past_a_vector_it_cannot_parse(vectors):
 
 
 def test_a_v4_only_record_with_no_word_is_unknown_not_a_crash():
-    """The recorded gap in NOTES-0_4 §8.1, pinned. If v4 support ever lands,
-    this is the test that should fail."""
     assert severity_of(_vuln(severity=[{"type": "CVSS_V4", "score": V4_ONLY}])) == "unknown"
 
 
@@ -191,8 +177,6 @@ def test_every_vulnerability_carries_the_source_that_found_it():
 
 @respx.mock
 def test_fetch_sends_the_resolved_version():
-    """Appendix B: are you querying the version you resolved, or the version
-    the user typed? Asserted mechanically."""
     route = respx.post(OSV_QUERY_URL).respond(200, json={})
     _fetch()
     assert json.loads(route.calls.last.request.content) == {
@@ -213,7 +197,6 @@ def test_an_empty_result_is_a_successful_clean_answer(payload):
 
 @respx.mock
 def test_fetch_returns_the_raw_payload_not_parsed_models():
-    """Step 1.4 caches exactly what fetch returns, so it must be raw."""
     respx.post(OSV_QUERY_URL).respond(200, json={"vulns": [_vuln()]})
     assert _fetch().data == {"vulns": [_vuln()]}
 
@@ -227,7 +210,6 @@ def test_fetch_returns_the_raw_payload_not_parsed_models():
     (httpx.Response(200, json=[]), "not a JSON object"),
 ])
 def test_a_failure_is_not_a_clean_answer(response, fragment):
-    """Same empty data as the clean case; only `ok` tells them apart. §9.1."""
     respx.post(OSV_QUERY_URL).mock(return_value=response)
     r = _fetch()
     assert r.ok is False and r.skipped is False
