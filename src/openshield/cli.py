@@ -63,7 +63,7 @@ def check(specs: list[str] = typer.Argument(..., help="npm package specifiers"))
 
 @app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def intercept(ctx: typer.Context):
-    """The full loop: analyze, prompt, run or refuse. Invoked by the M2 shim."""
+    """Analyze, prompt, then run or refuse the npm command."""
     raise typer.Exit(code=run_intercept(ctx.args))
 
 @app.command()
@@ -72,9 +72,8 @@ def config(
     path: bool = typer.Option(False, "--path", help="print the file location"),
 ):
     """Show effective settings and where each came from."""
-    # Imported INSIDE the function on purpose: this command is also named
-    # `config`, so a module-level `from . import config` would be shadowed by
-    # it and every reference here would hit the function instead.
+    # Imported here because a module-level `config` would be shadowed by this
+    # command's own name.
     from . import config as config_module
 
     if path:

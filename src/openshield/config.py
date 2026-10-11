@@ -5,26 +5,20 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-# §13's keys, with the values M0 hard-coded. Changing a default here changes
-# behaviour for everyone who has no config file, so each one is a decision.
+# Changing a default changes behaviour for every user without a config file.
 DEFAULTS: dict[str, Any] = {
-    # §11.1 policies. fail-closed is the project's standing posture: the cost
-    # of refusing is "type npm install yourself"; the cost of allowing is
-    # "install unreviewed code".
+    # Policies default to the safe (refusing) option.
     "offline_policy": "fail-closed",
     "noninteractive_policy": "deny",
     "unresolvable_policy": "prompt",
 
-    # M1 Step 1.4.
     "cache_ttl_hours": 24,
 
-    # M2, reserved now so the key names do not shift under stored data.
+    # Reserved for decision storage.
     "decision_ttl_days": 90,
     "approval_scope": "project",
 }
 
-# A value outside these sets is a typo, and a typo that silently falls back to
-# the default is a policy the user believes they set. Validated loudly instead.
 _CHOICES: dict[str, frozenset[str]] = {
     "offline_policy": frozenset({"fail-closed", "fail-open"}),
     "noninteractive_policy": frozenset({"deny", "allow"}),
@@ -36,11 +30,10 @@ _INTEGERS = frozenset({"cache_ttl_hours", "decision_ttl_days"})
 
 _ENV_PREFIX = "OPENSHIELD_"
 
-# Never readable through this module, never writable to the file. Listed so
-# that a future key cannot be added with one of these names by accident.
+# Secrets are environment-only and can never be read through this module.
 _SECRET_KEYS = frozenset({"github_token"})
 
-_TEMPLATE = '''# OpenShield configuration. See SPEC.md §13.
+_TEMPLATE = '''# OpenShield configuration.
 #
 # Secrets are NOT configured here -- set OPENSHIELD_GITHUB_TOKEN in your
 # environment instead. A config file ends up in screenshots and bug reports.
@@ -63,7 +56,7 @@ unresolvable_policy = "prompt"
 # How long a cached response stays usable.
 cache_ttl_hours = 24
 
-# M2. How long an approval is remembered, and whether it applies to this
+# How long an approval is remembered, and whether it applies to this
 # project or everywhere.
 decision_ttl_days = 90
 approval_scope = "project"
@@ -71,13 +64,7 @@ approval_scope = "project"
 
 
 def config_path() -> Path:
-    """`~/.openshield/config.toml`, or wherever OPENSHIELD_CONFIG points.
-
-    The override exists for tests, for the same reason the cache has one: a
-    test that read the real config would pass or fail depending on what you had
-    configured that morning. Read on every call, so there is no module state to
-    reset.
-    """
+    """`~/.openshield/config.toml`, or OPENSHIELD_CONFIG if set (used by tests)."""
     override = os.environ.get("OPENSHIELD_CONFIG")
     if override:
         return Path(override)
@@ -85,12 +72,7 @@ def config_path() -> Path:
 
 
 def ensure_file() -> bool:
-    """Write the commented template if no config file exists.
-
-    Returns True if a file was created. Called once from the CLI rather than on
-    every read: writing a file as a side effect of reading one is the kind of
-    surprise that makes a tool feel untrustworthy.
-    """
+    """Write the template if no config file exists. Returns True if created."""
     path = config_path()
     if path.exists():
         return False
@@ -100,13 +82,7 @@ def ensure_file() -> bool:
 
 
 def _from_file() -> dict[str, Any]:
-    """The parsed file, or {} for anything unreadable.
-
-    NEVER RAISES. A malformed config must not take the tool down -- the same
-    rule the cache follows, for the same reason: this is a convenience layer,
-    and a convenience layer that can break the tool is a liability. A bad file
-    degrades to the defaults, which are the safe values.
-    """
+    """The parsed file, or {} if missing or unreadable. Never raises."""
     path = config_path()
     try:
         with path.open("rb") as handle:
@@ -121,17 +97,13 @@ def _from_env(key: str) -> str | None:
 
 
 def get(key: str) -> Any:
-    """One setting, resolved. env > file > default.
+    """Resolve one setting: environment, then file, then default.
 
-    An unknown key is a programming error, not a user error, so it raises --
-    a typo in the code should not silently read None.
+    Raises KeyError for secrets and unknown keys.
     """
-    # Secrets first: they are also absent from DEFAULTS, so the generic
-    # "unknown key" branch would otherwise shadow the specific message. The
-    # more specific check goes first -- found by the test asserting the
-    # message, not just the exception type.
+    # Checked before the unknown-key branch so secrets get the specific message.
     if key in _SECRET_KEYS:
-        raise KeyError(f"{key!r} is a secret and is environment-only (SPEC 13)")
+        raise KeyError(f"{key!r} is a secret and is environment-only")
     if key not in DEFAULTS:
         raise KeyError(f"unknown config key: {key!r}")
 
@@ -145,12 +117,9 @@ def get(key: str) -> Any:
 
 
 def _coerce(key: str, raw: Any) -> Any:
-    """Validate, or fall back to the default.
+    """Validate a value, falling back to the default if it is invalid.
 
-    A value outside the allowed set falls back SILENTLY here rather than
-    raising, because the alternative is a tool that refuses to start because of
-    a typo in a comment-heavy config file. `openshield config` shows the
-    effective values, which is where a typo becomes visible -- see §1.6.4.
+    Invalid values show up as `source: default` in `openshield config`.
     """
     if key in _INTEGERS:
         try:
@@ -168,13 +137,7 @@ def _coerce(key: str, raw: Any) -> Any:
 
 
 def effective() -> dict[str, Any]:
-    """Every setting with its resolved value and where it came from.
-
-    `openshield config` prints this. The SOURCE is the useful half: "I set
-    offline_policy and it is still fail-closed" is answered by seeing that the
-    value came from `default`, which means the file was not read or the key was
-    misspelled.
-    """
+    """Every setting with its resolved value and source (env, file or default)."""
     out: dict[str, Any] = {}
     file_values = _from_file()
     for key in DEFAULTS:

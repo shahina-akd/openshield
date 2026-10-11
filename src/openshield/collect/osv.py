@@ -1,9 +1,7 @@
-"""The OSV collector. PackageRef in, raw payload out; parse_vulns is separate.
+"""OSV vulnerability collector.
 
-M1 Step 1.1 converted the transport to async. parse_vulns and the extraction
-helpers are UNCHANGED from M0 -- which is the payoff of keeping transport and
-parsing split (NOTES-M1 B.1): the async conversion rewrote only fetch(), and
-M1 Step 1.4's cache will wrap only fetch().
+fetch() returns the raw payload; parse_vulns() turns it into Vulnerability
+models.
 """
 from __future__ import annotations
 
@@ -21,9 +19,7 @@ MAX_PAGES = 5
 
 # ------------------------------ severity words ---------------------------------
 
-# GHSA says MODERATE. CVSS says MEDIUM. §9.1 says moderate. Both publisher
-# words map onto our vocabulary; missing the CVSS spelling means every
-# CVSS-derived medium finding silently lands on "unknown" and scores zero.
+# GHSA uses "moderate" and CVSS uses "medium"; both map to "moderate".
 _WORDS: dict[str, Severity] = {
     "critical": "critical",
     "high": "high",
@@ -34,10 +30,7 @@ _WORDS: dict[str, Severity] = {
 
 
 def _word(value: object) -> Severity | None:
-    """A publisher's severity word, or None if it is not one we recognise.
-
-    No fuzzy matching: "unknown" is honest, a guess is not.
-    """
+    """A recognised severity word, or None. No fuzzy matching."""
     if not isinstance(value, str):
         return None
     return _WORDS.get(value.strip().casefold())
@@ -46,16 +39,10 @@ def _word(value: object) -> Severity | None:
 # -------------------------------- extraction -----------------------------------
 
 def severity_of(vuln: dict) -> Severity:
-    """OSV publishes severity in three places because three parties disagree.
+    """Determine severity from the first source that provides one.
 
-    Order is not arbitrary: the curating publisher's word beats a number
-    computed from a vector, because that word is what `npm audit` and GitHub
-    already showed the user. Our "high" should mean what their "high" means.
-
-    Measured 2026-09-10 (NOTES-0_4 §8.1): tier 1 fired on 100% of ~40 npm
-    advisories sampled, so tiers 2-3 are insurance rather than working code.
-    Tier 1 is still not redundant -- GHSA-8hc4-vh64-cxmj carries a word and an
-    empty vector list, so tier 3 could never cover for it.
+    The publisher's own word is preferred over a computed CVSS score, so the
+    rating matches what `npm audit` and GitHub show.
     """
     word = _word(_dig(vuln, "database_specific", "severity"))
     if word:
@@ -66,9 +53,8 @@ def severity_of(vuln: dict) -> Severity:
         if word:
             return word
 
-    # CONTINUE past a vector we cannot parse -- do not stop at the first entry.
-    # Records carry several vectors in no guaranteed order: [CVSS_V4, CVSS_V3]
-    # still has a usable score in it, and base_score() declines v4.
+    # Vectors appear in no fixed order, so skip unparseable ones (e.g. v4)
+    # rather than stopping at the first.
     for entry in _as_list(vuln.get("severity")):
         score = cvss.base_score(_dig(entry, "score"))
         if score is not None:
@@ -78,12 +64,10 @@ def severity_of(vuln: dict) -> Severity:
 
 
 def fixed_versions(vuln: dict, ref: PackageRef) -> list[str]:
-    """Every 'fixed' event for THIS package, in record order, deduped.
+    """Every 'fixed' version for this package, in record order, deduplicated.
 
-    The ecosystem check is not tidiness: one advisory can carry affected[]
-    entries for several ecosystems, and package names collide across them.
-    Comparing against ref.ecosystem rather than a literal "npm" keeps adding
-    PyPI a type error rather than a filter that silently matches nothing.
+    Filtered by ecosystem as well as name, since one advisory can cover
+    several ecosystems with colliding package names.
     """
     out: list[str] = []
     for affected in _as_list(vuln.get("affected")):
@@ -101,18 +85,16 @@ def fixed_versions(vuln: dict, ref: PackageRef) -> list[str]:
 
 
 def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulnerability]:
-    """PURE: dict in, models out. Never raises. Unchanged by the async move."""
+    """Raw payload -> Vulnerability models. Pure; never raises."""
     out: list[Vulnerability] = []
     for vuln in _as_list(_dig(payload, "vulns")):
         if not isinstance(vuln, dict):
             continue
-        # A retracted advisory is a false positive, and false positives erode
-        # exactly the attention §3.3.4 says the score exists to direct.
         if vuln.get("withdrawn"):
             continue
         identifier = vuln.get("id")
         if not isinstance(identifier, str) or not identifier:
-            continue          # unciteable -- §4 needs a named evidence field
+            continue
         summary = vuln.get("summary")
         out.append(Vulnerability(
             id=identifier,
@@ -128,21 +110,14 @@ def parse_vulns(payload: dict, ref: PackageRef, source: SourceRef) -> list[Vulne
 # -------------------------------- transport ------------------------------------
 
 async def fetch(ref: PackageRef, client: httpx.AsyncClient) -> CollectorResult:
-    """POST the query (following pagination). Returns the RAW payload.
+    """Query OSV, following pagination, and return the raw payload.
 
-    Raw, not parsed: Step 1.4 caches exactly this, because parsers change
-    weekly during development and cached raw responses survive that.
-
-    Never raises an Exception -- the never-raises rule, adopted in M0. A
-    BaseException (Ctrl-C, the test suite's network guard) is left alone and
-    propagates, which is what `except Exception` rather than a bare except is
-    for.
+    Never raises an Exception; BaseExceptions propagate.
     """
     try:
         return await _query(ref, client)
     except httpx.TimeoutException:
-        # BEFORE RequestError: TimeoutException subclasses TransportError
-        # subclasses RequestError. Reversed, this branch is dead code.
+        # Must precede RequestError, which is its superclass.
         return CollectorResult(ok=False, error="timeout after 8s")
     except httpx.RequestError as exc:
         return CollectorResult(ok=False, error=f"network error: {type(exc).__name__}")
@@ -159,8 +134,8 @@ async def _query(ref: PackageRef, client: httpx.AsyncClient) -> CollectorResult:
     for _ in range(MAX_PAGES):
         page = dict(body, page_token=token) if token else body
         response = await client.post(OSV_QUERY_URL, json=page)
-        # No 404 branch, unlike resolve(): a package with no advisories comes
-        # back 200 with an empty body. Every non-200 is a failure to reach OSV.
+        # OSV returns 200 with an empty body for a package with no advisories,
+        # so any other status is a failure.
         if response.status_code != 200:
             return CollectorResult(ok=False, error=f"{response.status_code} from api.osv.dev")
         try:
@@ -175,12 +150,10 @@ async def _query(ref: PackageRef, client: httpx.AsyncClient) -> CollectorResult:
             return CollectorResult(ok=True, data={"vulns": vulns}, source=_source())
         token = next_token
 
-    # Out of pages with a token outstanding: an answer, and an incomplete one.
-    # ok=True, but named, so it surfaces as degradation rather than rounding up.
+    # Page limit reached with more results pending: report as incomplete.
     return CollectorResult(ok=True, data={"vulns": vulns}, source=_source(),
                            error=f"results truncated after {MAX_PAGES} pages")
 
 
 def _source() -> SourceRef:
-    # The clock read belongs in a collector (§9.2 bans it in score(), not here).
     return SourceRef(name=base.NAME_OSV, fetched_at=datetime.now(timezone.utc))

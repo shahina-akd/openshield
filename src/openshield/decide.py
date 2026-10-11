@@ -1,4 +1,4 @@
-"""decide.py -- ask the human. Knows nothing about npm, packages, or storage."""
+"""Ask the user whether to proceed."""
 from __future__ import annotations
 
 import os
@@ -15,8 +15,6 @@ def prompt(question: str = "install?") -> DecisionAction:
     try:
         answer = input(f"{question} [y/N] ").strip().casefold()
     except EOFError:
-        # stdin closed mid-prompt. Nobody answered, so this is a policy
-        # outcome, not a rejection -- run.py maps it to POLICY_BLOCKED.
         return "reject"
     except KeyboardInterrupt:
         print()

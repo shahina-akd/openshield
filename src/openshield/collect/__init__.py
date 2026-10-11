@@ -1,16 +1,13 @@
-"""Fan-out, degradation, and assembly. collect(refs) -> list[Evidence].
+"""Collect evidence for each package: collect(refs) -> list[Evidence].
 
-Two waves, not one gather (NOTES-M1 A.1): GitHub needs repository.url, which
-only the npm registry collector can supply.
+Runs in two waves because GitHub needs the repository URL from npm:
 
     wave 1:   osv   npm-registry      concurrent, independent
                           |
-    wave 2:            github         only after npm has answered
+    wave 2:            github         after npm has answered
 
-COLLECTORS ARE CALLED THROUGH THEIR MODULES -- osv.fetch, npm.fetch, npm.parse,
-github.fetch_for -- never `from .github import fetch_for`. The tests patch the
-module attribute; a local import binds a name the patch cannot reach, and every
-degradation test would go green against unpatched production code.
+Collectors are called through their modules (osv.fetch, npm.fetch, ...) rather
+than imported by name, so tests can patch the module attributes.
 """
 from __future__ import annotations
 
@@ -26,23 +23,15 @@ from .base import CollectorResult
 
 
 def collect(refs: list[PackageRef]) -> list[Evidence]:
-    """The ONE asyncio.run in the codebase. run.py stays synchronous.
-
-    This boundary is also what keeps the test suite synchronous: everything
-    above it -- run.py, cli.py, and every test that goes through collect() --
-    is ordinary sync code, so no async test runner is needed anywhere.
-    """
+    """The only asyncio.run in the codebase; everything above it stays sync."""
     if not refs:
-        return []            # no refs, no client -- same as resolve_all
+        return []
     return asyncio.run(_collect_all(refs))
 
 
 async def _collect_all(refs: list[PackageRef]) -> list[Evidence]:
-    # One pool for every collector and every ref (NOTES-M1 B.13).
     async with httpx.AsyncClient(timeout=base.TIMEOUT, headers=base.HEADERS) as client:
-        # return_exceptions=True: Step 0.3's rule at the batch level (D.2).
-        # One command line carries several specifiers, and an exception in one
-        # ref's pipeline must not lose the others' evidence.
+        # A failure in one package's pipeline must not lose the others' evidence.
         results = await asyncio.gather(
             *(_collect_one(r, client) for r in refs), return_exceptions=True
         )
@@ -53,24 +42,12 @@ async def _collect_all(refs: list[PackageRef]) -> list[Evidence]:
 
 
 async def _cached(source: str, ref: PackageRef, make_request) -> CollectorResult:
-    """Read-through: hit the cache, else fetch and store on success.
+    """Return a cached response, or fetch and cache it on success.
 
-    `make_request` is a CALLABLE, not a coroutine. Calling an async function
-    creates a coroutine immediately -- it does not run it -- so passing
-    `osv.fetch(ref, client)` would build one on every cache HIT and then
-    discard it unawaited, which Python reports as
-    `RuntimeWarning: coroutine 'fetch' was never awaited`. Harmless here, but
-    it means the cache saved nothing: the request object was still constructed.
-    A zero-argument lambda defers creation until there is actually a miss.
-
-    The cache wraps the TRANSPORT half only, which is the whole reason Step 1.1
-    kept transport and parsing separate (NOTES-M1 B.1). Parsing still runs on
-    every request, hit or miss -- which is what keeps the age integers correct
-    (B.2).
-
-    SUCCESSES ONLY are stored (B.3). A cached 503 is a source that stays broken
-    for a day after it recovered, and `from_cache=True` on a failure would
-    render as 'as of nine hours ago' about something that never succeeded.
+    `make_request` is a zero-argument callable so the coroutine is only created
+    on a cache miss. Only raw transport payloads are cached; parsing runs on
+    every call so derived values such as ages stay current. Failures are never
+    cached.
     """
     hit = cache.get(source, ref.canonical,
                     ttl_hours=config.get("cache_ttl_hours"))
@@ -88,7 +65,6 @@ async def _cached(source: str, ref: PackageRef, make_request) -> CollectorResult
 
 
 async def _collect_one(ref: PackageRef, client: httpx.AsyncClient) -> Evidence:
-    # WAVE 1 -- independent, concurrent. gather protects each from the other.
     osv_raw, npm_raw = await asyncio.gather(
         _cached(base.NAME_OSV, ref, lambda: osv.fetch(ref, client)),
         _cached(base.NAME_NPM, ref, lambda: npm.fetch(ref, client)),
@@ -99,36 +75,29 @@ async def _collect_one(ref: PackageRef, client: httpx.AsyncClient) -> Evidence:
 
     registry = npm.parse(npm_result.data, ref) if npm_result.ok else None
 
-    # WAVE 2 -- depends on wave 1. Not inside a gather, so it needs the same
-    # protection gather gives wave 1, spelled out. The first draft of this
-    # module left it unguarded, and a raise in github.fetch_for escaped
-    # _collect_one entirely (D.2).
+    # Wave 2 is outside gather, so it needs its own exception guard.
     if npm_result.skipped:
-        # npm was not ATTEMPTED, so the repository was never looked for.
-        # Nothing failed; GitHub is simply not attempted either. Without this
-        # branch, fetch_for would read registry=None as a failed lookup and
-        # put a false line in degraded_sources.
+        # npm was not attempted, so GitHub is not attempted either. Without this
+        # branch fetch_for would report registry=None as a failed lookup.
         gh_result = CollectorResult(
             ok=False, skipped=True, error="not attempted (registry not consulted)"
         )
     else:
         try:
-            # npm_result.ok travels with the parsed registry so fetch_for can
-            # tell a failed lookup from an unreadable 200 (D.3).
+            # npm_result.ok lets fetch_for tell a failed lookup from an
+            # unreadable response.
             gh_result = await _cached(
                 base.NAME_GITHUB, ref,
                 lambda: github.fetch_for(registry, npm_result.ok, ref, client),
             )
-        except Exception as exc:        # Exception only -- see base._survive
+        except Exception as exc:
             gh_result = base._survive(exc)
 
     return _assemble(ref, osv_result, npm_result, gh_result, registry)
 
 
 def _assemble(ref, osv_r, npm_r, gh_r, registry) -> Evidence:
-    # Names paired with results AT THE POINT OF USE. The first draft zipped a
-    # names tuple against a results list positionally; reorder one and a
-    # GitHub 403 renders as "osv: 403 rate limited" (D.5).
+    # Names are paired with results here so reordering cannot mislabel an error.
     named = (
         (base.NAME_OSV, osv_r),
         (base.NAME_NPM, npm_r),
@@ -142,23 +111,21 @@ def _assemble(ref, osv_r, npm_r, gh_r, registry) -> Evidence:
             osv.parse_vulns(osv_r.data, ref, osv_r.source) if osv_r.ok else []
         ),
         registry=registry,
-        # None, never a defaulted RepositoryInfo(): None means "not collected",
-        # and a default would be a measurement that never happened (A.2).
+        # None means "not collected"; a default RepositoryInfo() would imply a
+        # measurement.
         repository=github.parse(gh_r.data, gh_r.source) if gh_r.ok else None,
-        # Only sources that ANSWERED. `check` prints these as having answered.
         sources=[r.source for _, r in named if r.ok and r.source],
-        partial=bool(degraded),          # satisfies the Evidence validator
+        partial=bool(degraded),
         degraded_sources=degraded,
         unavailable=[f"{n}: {r.error}" for n, r in named if r.skipped],
     )
 
 
 def _failed_evidence(ref: PackageRef, exc: BaseException) -> Evidence:
-    """One ref's pipeline broke. Its Evidence says so; the others are intact.
+    """Evidence for a package whose pipeline raised.
 
-    No sources, partial=True, the exception named -- which run.py routes
-    through offline_policy exactly as it routes a total source failure.
-    A non-Exception BaseException is re-raised for the same reason as _survive.
+    run.py treats it like a total source failure. Non-Exception BaseExceptions
+    are re-raised, as in base._survive.
     """
     if not isinstance(exc, Exception):
         raise exc

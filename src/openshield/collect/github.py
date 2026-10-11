@@ -1,18 +1,11 @@
-"""The GitHub collector -- wave 2, and the only one with a dependency.
+"""GitHub repository collector.
 
     GET https://api.github.com/repos/{owner}/{repo}
     GET https://api.github.com/repos/{owner}/{repo}/contributors?per_page=1&anon=1
 
-It runs after npm because it needs `repository.url`, which only the registry
-can supply (NOTES-M1 A.1). The BRANCH logic was written in Step 1.1 -- what the
-absence of a repository means is assembly logic, not transport -- and this step
-adds the two requests behind it.
-
-AUTHENTICATION IS NOT OPTIONAL HERE (NOTES-M1 A.3). Without a token GitHub
-allows 60 requests an hour, which M2's ambient interception exhausts in
-minutes. So "no token" is a SKIP rather than a failure: it fires on every run
-for an unconfigured user, and a warning that always fires is furniture -- it
-would train the reader past the OSV failures that matter.
+Runs after the npm collector, which supplies the repository. A token is
+required; without one the collector is skipped rather than failed, since the
+unauthenticated rate limit is too low to be useful.
 """
 from __future__ import annotations
 
@@ -25,13 +18,13 @@ import httpx
 from ..models import PackageRef, RegistryInfo, RepositoryInfo, SourceRef
 from . import base
 from .base import CollectorResult, _dig
-from .npm import _parse_iso            # same Z-suffix trap; one implementation
+from .npm import _parse_iso
 
 API = "https://api.github.com"
 TOKEN_ENV = "OPENSHIELD_GITHUB_TOKEN"
 
-# `rel="last"` carries the final page number. With per_page=1 that number IS
-# the contributor count -- GitHub does not expose the count any other way.
+# With per_page=1, the page number in the `rel="last"` link is the
+# contributor count.
 _LAST_PAGE = re.compile(r'[?&]page=(\d+)[^>]*>;\s*rel="last"')
 
 
@@ -43,32 +36,24 @@ async def fetch_for(
     ref: PackageRef,
     client: httpx.AsyncClient,
 ) -> CollectorResult:
-    """Every reason not to fetch lives here, in one place.
+    """Decide whether to fetch, then fetch.
 
-    Four outcomes, and the difference between them is the whole of A.3 and D.3:
-
-      no token            -> SKIP. Not degradation; reported quietly.
-      registry unreadable -> degradation, and say WHICH thing broke.
-      no repository       -> SKIP. Knowing there is none is a complete answer.
-      a repository        -> fetch it.
+      no token            -> skip
+      registry unreadable -> failure, naming what broke
+      no repository       -> skip
+      a repository        -> fetch it
     """
     token = os.environ.get(TOKEN_ENV)
     if not token:
         return CollectorResult(ok=False, skipped=True, error="no token configured")
 
     if registry is None:
-        # Degradation either way -- the repository IS unknown -- but an
-        # unreadable 200 is not a failed lookup, and claiming otherwise puts a
-        # false line in degraded_sources, the one block §9.1 requires to be
-        # trustworthy (D.3).
         reason = ("registry answered but could not be read" if registry_ok
                   else "registry lookup failed")
         return CollectorResult(ok=False, error=f"repository unknown ({reason})")
 
     if not registry.repository_owner or not registry.repository_name:
-        # Includes GitLab, Bitbucket and monorepo subpaths, which npm.py
-        # deliberately refuses to guess at. B.5: nothing to fetch is a
-        # complete answer.
+        # Includes non-GitHub hosts and monorepo subpaths.
         return CollectorResult(ok=False, skipped=True,
                                error="package declares no GitHub repository")
 
@@ -76,9 +61,6 @@ async def fetch_for(
         return await _fetch(registry.repository_owner, registry.repository_name,
                             token, client)
     except Exception as exc:
-        # The never-raises rule. _collect_one guards wave 2 as a backstop, but
-        # a raise there is reported as `github: KeyError: ...` rather than as a
-        # sentence a person can act on.
         return CollectorResult(ok=False, error=f"{type(exc).__name__}: {exc}")
 
 
@@ -86,11 +68,10 @@ async def fetch_for(
 
 async def _fetch(owner: str, repo: str, token: str,
                  client: httpx.AsyncClient) -> CollectorResult:
-    """The repository, and the contributor count, concurrently.
+    """Fetch the repository and contributor count concurrently.
 
-    The contributor count is a nice-to-have: its failure leaves `contributors`
-    as None rather than failing the collector, the same relationship the
-    downloads host has to the packument in npm.py.
+    A failed contributor lookup leaves the count unknown rather than failing
+    the collector.
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -110,8 +91,7 @@ async def _fetch(owner: str, repo: str, token: str,
 
     data = dict(repo_result.data)
     if contrib.ok:
-        # Merged under a key GitHub itself never sends, so parse() cannot
-        # confuse a computed value with a reported one.
+        # Underscore-prefixed so it cannot collide with a GitHub field.
         data["_contributor_count"] = _dig(contrib.data, "count")
         return CollectorResult(ok=True, data=data, source=_source())
 
@@ -141,33 +121,23 @@ async def _get_repo(client, owner: str, repo: str, headers: dict) -> CollectorRe
 
 
 def _status_error(response: httpx.Response) -> str | None:
-    """None when the response is usable; a named reason otherwise.
-
-    404 and 403 get DISTINCT messages (NOTES-M1 B.5). Both are failures, for
-    different reasons, and in six months you will want to tell them apart at a
-    glance rather than by re-reading this function.
-    """
+    """None for a usable response, otherwise a reason that distinguishes 404,
+    rate limiting and other 403s."""
     code = response.status_code
     if code == 200:
         return None
     if code == 404:
-        # Moved, renamed, made private, or deleted. We do NOT know which, and
-        # we do not know anything about the repository -- so this is a failure,
-        # unlike a 404 from the npm downloads host, which is a real answer.
         return "404 -- repository moved, renamed, private or deleted"
     if code in (403, 429):
         remaining = response.headers.get("X-RateLimit-Remaining")
         if remaining == "0":
-            # Say WHEN it resets, not merely that it failed. A message you can
-            # act on beats a message you can only read.
             return f"rate limited -- resets {_reset_hint(response)}"
         return f"{code} -- forbidden (token scope or repository access)"
     return f"{code} from api.github.com"
 
 
 def _reset_hint(response: httpx.Response) -> str:
-    """X-RateLimit-Reset is a Unix timestamp. Rendered as a UTC clock time,
-    because 'resets at 18:42Z' is actionable and '1760000000' is not."""
+    """X-RateLimit-Reset as a UTC clock time, e.g. 'at 18:42Z'."""
     from datetime import datetime, timezone
     raw = response.headers.get("X-RateLimit-Reset")
     try:
@@ -179,12 +149,9 @@ def _reset_hint(response: httpx.Response) -> str:
 
 async def _get_contributor_count(client, owner: str, repo: str,
                                  headers: dict) -> CollectorResult:
-    """One contributor per page, then read the LAST page number.
+    """Count contributors via the Link header of a one-per-page listing.
 
-    GitHub does not expose a contributor count, so the trick is to ask for
-    pages of one and let the Link header do the counting. anon=1 includes
-    contributors without GitHub accounts, which is what the number means to a
-    reader.
+    anon=1 includes contributors without GitHub accounts.
     """
     url = f"{API}/repos/{owner}/{repo}/contributors?per_page=1&anon=1"
     try:
@@ -202,16 +169,11 @@ async def _get_contributor_count(client, owner: str, repo: str,
 
 
 def contributor_count(response: httpx.Response) -> int | None:
-    """The Link header's last page, or 1, or None.
+    """The Link header's last page; otherwise the body length; None if the body
+    is not a list.
 
-    NO LINK HEADER MEANS ONE PAGE, SO THE FALLBACK IS 1 -- NEVER 0. Zero would
-    read as "no contributors" and cost the package -8 under §9.4, for a
-    repository that simply has a single contributor or for a parse that went
-    slightly wrong. Same family as OSV's next_page_token: an answer that is
-    complete only if you notice the continuation.
-
-    None is reserved for "the body was not a list of contributors at all",
-    which means we genuinely do not know.
+    Without a Link header there is only one page, so the fallback counts the
+    body rather than assuming zero.
     """
     link = response.headers.get("Link") or response.headers.get("link")
     if link:
@@ -219,8 +181,6 @@ def contributor_count(response: httpx.Response) -> int | None:
         if match:
             return int(match.group(1))
 
-    # No Link header: one page at most. Distinguish an empty list (a real zero,
-    # which GitHub returns for a repository with no commits) from a non-list.
     try:
         payload = response.json()
     except ValueError:
@@ -238,15 +198,10 @@ def _source() -> SourceRef:
 # -------------------------------- parsing -------------------------------------
 
 def parse(payload: dict, source: SourceRef | None) -> RepositoryInfo | None:
-    """Raw repository JSON -> RepositoryInfo, or None if unreadable.
+    """Repository JSON -> RepositoryInfo, or None if unreadable.
 
-    Same None-versus-default rule as npm.parse (D.3): None means "could not
-    read it". Unlike the registry, nothing downstream branches on this
-    distinction yet -- but §9.4 does, because archived=None must not score the
-    same as archived=False (A.2).
-
-    THE CLOCK READ IS HERE, NOT IN fetch (B.2). parse runs on every request,
-    cache hit or miss, so a cached pushed_at still yields a correct age.
+    The age is computed here rather than in fetch so it stays correct when the
+    payload comes from the cache.
     """
     if not isinstance(payload, dict) or "archived" not in payload:
         return None
