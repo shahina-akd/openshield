@@ -66,3 +66,8 @@ def isolated_config(monkeypatch, tmp_path):
     """Give each test an empty config path in a not-yet-created directory."""
     monkeypatch.setenv("OPENSHIELD_CONFIG",
                        str(tmp_path / "openshield" / "config.toml"))
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENSHIELD_DB", str(tmp_path / "openshield.db"))
