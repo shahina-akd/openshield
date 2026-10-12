@@ -5,7 +5,7 @@ install.
 """
 from __future__ import annotations
 
-from .models import Assessment, Severity, Unresolvable, Vulnerability
+from .models import Assessment, Severity, Unresolvable, Vulnerability, PackageRef, StoredDecision
 from .score import PARTIAL_CEILING
 
 
@@ -200,3 +200,32 @@ def render_unresolvable(u: Unresolvable) -> str:
     if help_text:
         out.append(f"     {help_text}")
     return "\n".join(out)
+
+
+def _ago(decision: StoredDecision) -> str:
+    days = decision.age_days
+    when = ("today" if days == 0 else
+            "yesterday" if days == 1 else f"{days} days ago")
+    scope = "globally" if decision.is_global else "in this project"
+    return f"{when} {scope}"
+
+
+def render_blocked(ref: PackageRef, decision: StoredDecision) -> str:
+    """A stored rejection, explained from the stored score.
+
+    Names the package and the command to revoke the rejection.
+    """
+    out = [ref.canonical, f"[!!] rejected {_ago(decision)} -- blocked on sight"]
+    if decision.trust_score is not None:
+        out.append(f"     scored {decision.trust_score}/100 under scoring "
+                   f"{decision.scoring_version} when you rejected it")
+    out.append(f"     to undo:  openshield history --revoke {ref.canonical}")
+    return "\n".join(out)
+
+
+def render_remembered(ref: PackageRef, decision: StoredDecision) -> str:
+    """A stored approval within the TTL, marked as not re-checked."""
+    return "\n".join([
+        ref.canonical,
+        f"[--] approved {_ago(decision)} -- not re-checked",
+    ])

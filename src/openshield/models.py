@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -218,3 +218,18 @@ class Invocation(BaseModel):
     specifiers: list[str]
     bare_install: bool = False  # `npm install` with no specifiers
     lockfile_install: bool = False
+
+class StoredDecision(BaseModel):
+    """A decision read back from the database."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action: Literal["approve", "reject"]
+    decided_at: datetime
+    trust_score: int | None = None
+    scoring_version: str | None = None
+    project_path: str | None = None
+    is_global: bool = False
+
+    @property
+    def age_days(self) -> int:
+        return (datetime.now(timezone.utc) - self.decided_at).days
